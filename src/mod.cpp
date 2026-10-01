@@ -22,6 +22,7 @@
 #include "m_Do/m_Do_controller_pad.h"
 
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 
 DEFINE_MOD();
@@ -137,6 +138,17 @@ MOD_EXPORT ModResult mod_update(ModError*) {
     const int room = dComIfGp_roomControl_getStayNo();
     const u32 held = mDoCPd_c::getHold(0);
     const u32 trig = mDoCPd_c::getTrig(0);
+
+    // ---- Diagnostic : R + Bas affiche stage / salle / position a l'ecran ----------------------
+    if ((held & PAD_TRIGGER_R) && (trig & PAD_BUTTON_DOWN)) {
+        char buf[200];
+        std::snprintf(buf, sizeof(buf), "stage %s, salle %d<br/>x=%.0f y=%.0f z=%.0f", stage, room,
+            player->current.pos.x, player->current.pos.y, player->current.pos.z);
+        toast("Position actuelle", buf);
+        mods::log::info("DIAG stage={} salle={} pos=({:.1f},{:.1f},{:.1f})", stage, room,
+            player->current.pos.x, player->current.pos.y, player->current.pos.z);
+        return MOD_OK;
+    }
 
     // ---- Dans le donjon : retour avec L + R + Z -------------------------------------------
     if (std::strcmp(stage, kDestStage) == 0) {

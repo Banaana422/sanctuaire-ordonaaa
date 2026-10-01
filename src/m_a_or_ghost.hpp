@@ -1,4 +1,17 @@
 #pragma once
+
+// IMPORTANT : ces en-tetes standard doivent etre inclus AVANT ceux du jeu, sinon les macros du
+// jeu perturbent la STL de Visual Studio (erreur C2440 dans <utility>).
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <functional>
+#include <memory>
+#include <new>
+#include <string>
+#include <utility>
+#include <vector>
+
 #include "mods/svc/actor.h"
 #include "f_op/f_op_actor.h"
 #include "SSystem/SComponent/c_phase.h"

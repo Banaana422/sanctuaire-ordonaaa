@@ -13,6 +13,7 @@
 // hypotheses a confirmer avec les messages du journal (console Dusklight).
 
 #include "mods/service.hpp"
+#include "mods/svc/actor.h"
 #include "mods/svc/config.h"
 #include "mods/svc/log.hpp"
 #include "mods/svc/ui.h"
@@ -21,12 +22,15 @@
 #include "f_op/f_op_actor.h"
 #include "m_Do/m_Do_controller_pad.h"
 
+#include "m_a_or_ghost.hpp"
+
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 
 DEFINE_MOD();
 IMPORT_SERVICE(LogService, svc_log);
+IMPORT_SERVICE(ActorService, svc_actor);
 IMPORT_SERVICE(ConfigService, svc_config);
 IMPORT_SERVICE(UiService, svc_ui);
 
@@ -101,6 +105,33 @@ bool registerVar(const char* name, ConfigVarType type, ConfigVarHandle* out) {
     return svc_config->register_var(mod_ctx, &desc, out) == MOD_OK;
 }
 
+
+// Fait apparaitre un bloc fantome devant Link.
+void spawnGhost(int kind, const cXyz& pos, int room, s16 angleY, const cXyz& scale) {
+    csXyz ang(0, angleY, 0);
+    cXyz p = pos;
+    cXyz sc = scale;
+    fopAcM_create(maOrGhost_c::sProcName, static_cast<u32>(kind), &p, room, &ang, &sc, -1);
+}
+
+// Salle de test : un vrai mur, un faux mur et une plateforme cachee en ligne devant Link.
+void spawnTestRoom(fopAc_ac_c* player, int room) {
+    const cXyz base = player->current.pos;
+    const s16 yaw = player->shape_angle.y;
+    const float a = static_cast<float>(yaw) * (3.14159265f / 32768.0f);
+    const float fx = std::sin(a), fz = std::cos(a);  // devant
+    const float rx = fz, rz = -fx;                   // droite
+    const float dist = 500.0f, gap = 450.0f;
+
+    auto at = [&](float side) {
+        return cXyz(base.x + fx * dist + rx * side, base.y, base.z + fz * dist + rz * side);
+    };
+    spawnGhost(OR_GHOST_REAL, at(-gap), room, yaw, cXyz(1.0f, 1.0f, 1.0f));
+    spawnGhost(OR_GHOST_FALSE, at(0.0f), room, yaw, cXyz(1.0f, 1.0f, 1.0f));
+    spawnGhost(OR_GHOST_HIDDEN, at(gap), room, yaw, cXyz(1.0f, 0.4f, 1.0f));
+    mods::log::info("Salle de test creee devant Link (salle {})", room);
+}
+
 }  // namespace
 
 extern "C" {
@@ -112,6 +143,12 @@ MOD_EXPORT ModResult mod_initialize(ModError*) {
         !registerVar("portal_z", CONFIG_VAR_FLOAT, &g_varZ))
     {
         mods::log::error("Impossible d'enregistrer la config du mod");
+        return MOD_ERROR;
+    }
+    if (svc_actor->register_actor(mod_ctx, &maOrGhost_c::sProfile, &maOrGhost_c::sProcName,
+            &maOrGhost_c::sActorHandle) != MOD_OK)
+    {
+        mods::log::error("Impossible d'enregistrer l'acteur " OR_GHOST_NAME);
         return MOD_ERROR;
     }
     loadConfig();
@@ -154,6 +191,22 @@ MOD_EXPORT ModResult mod_update(ModError*) {
         toast("Position actuelle", buf);
         mods::log::info("DIAG stage={} salle={} pos=({:.1f},{:.1f},{:.1f})", stage, room,
             player->current.pos.x, player->current.pos.y, player->current.pos.z);
+        return MOD_OK;
+    }
+
+    // ---- Masque de Zant : R + Gauche = equiper / retirer -------------------------------------
+    if ((held & PAD_TRIGGER_R) && (trig & PAD_BUTTON_LEFT)) {
+        g_orMask = !g_orMask;
+        toast(g_orMask ? "Masque equipe" : "Masque retire",
+            g_orMask ? "Les faux murs disparaissent, les passages caches apparaissent."
+                     : "Retour a la vue normale.");
+        return MOD_OK;
+    }
+
+    // ---- Salle de test : R + Droite = fait apparaitre 3 blocs devant Link -------------------
+    if ((held & PAD_TRIGGER_R) && (trig & PAD_BUTTON_RIGHT)) {
+        spawnTestRoom(player, room);
+        toast("Salle de test", "Gauche : vrai mur. Centre : faux mur. Droite : plateforme cachee.");
         return MOD_OK;
     }
 

@@ -20,7 +20,7 @@ configure_file(mod.json.in "${CMAKE_CURRENT_BINARY_DIR}/mod.json" @ONLY NEWLINE_
 
 add_mod(sanctuaire_ordona
         FEATURES game fmt
-        SOURCES src/mod.cpp
+        SOURCES src/mod.cpp src/m_a_or_ghost.cpp
         MOD_JSON "${CMAKE_CURRENT_BINARY_DIR}/mod.json"
         RES_DIR res
 )

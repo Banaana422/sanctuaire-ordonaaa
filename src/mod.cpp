@@ -35,7 +35,7 @@ namespace {
 // ---- Reglages (A VERIFIER dans le journal du jeu) -------------------------------------------
 // Cave de Link : stage + salle ou se trouve le miroir.
 constexpr const char* kPortalStage = "R_SP01";
-constexpr int kPortalRoom = 4;
+constexpr int kPortalRoom = 7;  // releve en jeu : cave de Link = R_SP01 salle 7
 constexpr float kPortalRadius = 120.0f;  // rayon d'activation (unites du jeu)
 
 // Destination : on reutilise la Caverne des Epreuves (D_SB01) comme squelette de donjon.
@@ -115,8 +115,15 @@ MOD_EXPORT ModResult mod_initialize(ModError*) {
         return MOD_ERROR;
     }
     loadConfig();
+    if (!g_portalSet) {
+        // Position relevee en jeu devant le miroir ; R + Haut permet de la changer.
+        g_px = 85.0f;
+        g_py = -1082.0f;
+        g_pz = -948.0f;
+        g_portalSet = true;
+    }
     mods::log::info("Sanctuaire d'Ordona charge. Miroir {}.",
-        g_portalSet ? "deja calibre" : "NON calibre (R + Haut dans la cave)");
+        "position du miroir chargee");
     return MOD_OK;
 }
 
@@ -142,7 +149,7 @@ MOD_EXPORT ModResult mod_update(ModError*) {
     // ---- Diagnostic : R + Bas affiche stage / salle / position a l'ecran ----------------------
     if ((held & PAD_TRIGGER_R) && (trig & PAD_BUTTON_DOWN)) {
         char buf[200];
-        std::snprintf(buf, sizeof(buf), "stage %s, salle %d<br/>x=%.0f y=%.0f z=%.0f", stage, room,
+        std::snprintf(buf, sizeof(buf), "stage %s, salle %d  |  x=%.0f y=%.0f z=%.0f", stage, room,
             player->current.pos.x, player->current.pos.y, player->current.pos.z);
         toast("Position actuelle", buf);
         mods::log::info("DIAG stage={} salle={} pos=({:.1f},{:.1f},{:.1f})", stage, room,

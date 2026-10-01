@@ -1,0 +1,7 @@
+{
+  "id": "fr.ordona.sanctuaire",
+  "name": "Sanctuaire d'Ordona",
+  "version": "@PROJECT_VERSION@",
+  "author": "Alban",
+  "description": "Un miroir dans la cave de Link ouvre un passage vers un donjon (prototype)."
+}

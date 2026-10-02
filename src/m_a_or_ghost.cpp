@@ -24,8 +24,13 @@ const ShapeDef kShapes[OR_SHAPE_COUNT] = {
 }  // namespace
 
 bool g_orMask = false;
+int g_orBlocksReady = 0;
 
 maOrGhost_c::~maOrGhost_c() {
+    if (mCounted) {
+        --g_orBlocksReady;
+        mCounted = false;
+    }
     if (mpCollider != NULL && mRegistered) {
         dComIfG_Bgsp().Release(mpCollider);
         mRegistered = false;
@@ -79,6 +84,7 @@ void maOrGhost_c::fitToTarget() {
 cPhs_Step maOrGhost_c::create() {
     fopAcM_ct(this, maOrGhost_c);
     mRegistered = false;
+    mCounted = false;
     mArc = NULL;
     mpCollider = NULL;
     mpModel = NULL;
@@ -96,6 +102,8 @@ cPhs_Step maOrGhost_c::create() {
         fopAcM_SetMtx(this, mpModel->getBaseTRMtx());
         fitToTarget();
         Execute();
+        mCounted = true;
+        ++g_orBlocksReady;
     }
     return step;
 }

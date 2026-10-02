@@ -1,23 +1,38 @@
-// Bloc "fantome" : meme modele que le rocher de la demo officielle (archive Wrock).
-// Selon le type et l'etat du masque, le bloc est visible/solide ou non.
+// Bloc "fantome" generique : une forme (modele du jeu) + un comportement lie au masque.
+// Pour les dalles (OR_SHAPE_SLAB), l'acteur MESURE le modele et l'etire pour obtenir exactement
+// la taille demandee (scale = taille voulue en unites du jeu). Position = centre en X/Z, bas en Y.
 
 #include "m_a_or_ghost.hpp"
 #include "d/d_com_inf_game.h"
 #include "res/Object/WRock.h"
+#include "res/Object/L8Lift.h"
+#include "res/Object/Tbox2.h"
 
-static const char* l_resName = "Wrock";
-static constexpr u32 heap_size = ALIGN_NEXT(13952, 0x20) + ALIGN_NEXT(1920, 0x20);
+namespace {
+struct ShapeDef {
+    const char* arc;
+    int bmd;
+    int dzb;
+    u32 heap;
+    bool autoSize;
+};
+const ShapeDef kShapes[OR_SHAPE_COUNT] = {
+    {"Wrock", dRes_INDEX_WROCK_BMD_WROCK_e, dRes_INDEX_WROCK_DZB_WROCK_e, 0x6000, false},
+    {"L8Lift", dRes_INDEX_L8LIFT_BMD_LV8_LIFTX_e, dRes_INDEX_L8LIFT_DZB_LV8_LIFTX_e, 0x8000, true},
+    {"Tbox2", dRes_INDEX_TBOX2_BMD_BOXA_e, dRes_INDEX_TBOX2_DZB_BOXAC_e, 0x8000, false},
+};
+}  // namespace
 
 bool g_orMask = false;
 
 maOrGhost_c::~maOrGhost_c() {
-    if (mpCollider != NULL) {
-        if (mRegistered) {
-            dComIfG_Bgsp().Release(mpCollider);
-            mRegistered = false;
-        }
+    if (mpCollider != NULL && mRegistered) {
+        dComIfG_Bgsp().Release(mpCollider);
+        mRegistered = false;
     }
-    dComIfG_resDelete(&mPhase, l_resName);
+    if (mArc != NULL) {
+        dComIfG_resDelete(&mPhase, mArc);
+    }
 }
 
 bool maOrGhost_c::isSolid() const {
@@ -31,29 +46,63 @@ bool maOrGhost_c::isSolid() const {
     }
 }
 
+void maOrGhost_c::fitToTarget() {
+    const ShapeDef& sd = kShapes[mShape];
+    const cXyz target = scale;
+
+    // 1) mesure du modele a l'echelle 1
+    scale.set(1.0f, 1.0f, 1.0f);
+    fopAcM_setCullSizeBox2(this, mpModel->getModelData());
+    const f32 minX = cull.box.min.x, minY = cull.box.min.y, minZ = cull.box.min.z;
+    const f32 maxX = cull.box.max.x, maxY = cull.box.max.y, maxZ = cull.box.max.z;
+
+    // 2) echelle finale
+    if (sd.autoSize) {
+        f32 bw = maxX - minX, bh = maxY - minY, bd = maxZ - minZ;
+        if (bw < 1.0f) bw = 1.0f;
+        if (bh < 1.0f) bh = 1.0f;
+        if (bd < 1.0f) bd = 1.0f;
+        scale.set(target.x / bw, target.y / bh, target.z / bd);
+    } else if (target.x > 0.0f && target.y > 0.0f && target.z > 0.0f) {
+        scale = target;
+    }
+
+    // 3) ancrage : centre en X/Z, bas en Y
+    current.pos.x -= 0.5f * (minX + maxX) * scale.x;
+    current.pos.z -= 0.5f * (minZ + maxZ) * scale.z;
+    current.pos.y -= minY * scale.y;
+    old.pos = current.pos;
+
+    fopAcM_setCullSizeBox2(this, mpModel->getModelData());
+}
+
 cPhs_Step maOrGhost_c::create() {
     fopAcM_ct(this, maOrGhost_c);
     mRegistered = false;
+    mArc = NULL;
+    mpCollider = NULL;
+    mpModel = NULL;
 
-    cPhs_Step step = dComIfG_resLoad(&mPhase, l_resName);
+    const int shapeId = static_cast<int>((parameters >> 8) & 0xFF);
+    mShape = (shapeId < OR_SHAPE_COUNT) ? shapeId : 0;
+    const ShapeDef& sd = kShapes[mShape];
+    mArc = sd.arc;
+
+    cPhs_Step step = dComIfG_resLoad(&mPhase, sd.arc);
     if (step == cPhs_COMPLEATE_e) {
-        if (!fopAcM_entrySolidHeap(this, createHeapCallBack, heap_size)) {
+        if (!fopAcM_entrySolidHeap(this, createHeapCallBack, sd.heap)) {
             return cPhs_ERROR_e;
         }
-
         fopAcM_SetMtx(this, mpModel->getBaseTRMtx());
-        fopAcM_setCullSizeBox(this, -800.0f, -800.0f, -800.0f, 800.0f, 800.0f, 800.0f);
-
-        mAcch.Set(&current.pos, &old.pos, this, 1, &mAcchCir, &speed, &current.angle, &shape_angle);
-
+        fitToTarget();
         Execute();
     }
     return step;
 }
 
 int maOrGhost_c::CreateHeap() {
-    J3DModelData* model_data =
-        (J3DModelData*)dComIfG_getObjectRes(l_resName, dRes_INDEX_WROCK_BMD_WROCK_e);
+    const ShapeDef& sd = kShapes[mShape];
+    J3DModelData* model_data = (J3DModelData*)dComIfG_getObjectRes(sd.arc, sd.bmd);
     if (model_data == NULL) {
         return 0;
     }
@@ -66,7 +115,7 @@ int maOrGhost_c::CreateHeap() {
     if (mpCollider == NULL) {
         return 0;
     }
-    cBgD_t* dzb = (cBgD_t*)dComIfG_getObjectRes(l_resName, dRes_INDEX_WROCK_DZB_WROCK_e);
+    cBgD_t* dzb = (cBgD_t*)dComIfG_getObjectRes(sd.arc, sd.dzb);
     if (mpCollider->Set(dzb, 1, &mColliderMtx) == true) {
         return 0;
     }
@@ -84,16 +133,6 @@ int maOrGhost_c::Delete() {
 }
 
 int maOrGhost_c::Execute() {
-    mAcch.CrrPos(dComIfG_Bgsp());
-
-    mGndChk = mAcch.m_gnd;
-    mGroundH = mAcch.GetGroundH();
-    if (mGroundH != -G_CM3D_F_INF) {
-        tevStr.YukaCol = dComIfG_Bgsp().GetPolyColor(mGndChk);
-        tevStr.room_no = dComIfG_Bgsp().GetRoomId(mGndChk);
-        fopAcM_SetRoomNo(this, dComIfG_Bgsp().GetRoomId(mGndChk));
-    }
-
     mDoMtx_stack_c::transS(current.pos.x, current.pos.y, current.pos.z);
     mDoMtx_stack_c::ZXYrotM(shape_angle);
     mDoMtx_stack_c::scaleM(scale);

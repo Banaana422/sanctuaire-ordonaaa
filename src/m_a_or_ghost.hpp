@@ -20,11 +20,21 @@
 
 #define OR_GHOST_NAME "orghost"
 
-// Type de bloc (parametre de l'acteur)
+// Forme (modele du jeu) : bits 8-15 du parametre. Comportement : bits 0-7.
+enum OrShape {
+    OR_SHAPE_ROCK = 0,   // rocher (archive Wrock)
+    OR_SHAPE_SLAB = 1,   // dalle du Palais du Crepuscule (archive L8Lift) : sol, murs
+    OR_SHAPE_CHEST = 2,  // coffre (archive Tbox2)
+    OR_SHAPE_COUNT
+};
+#define OR_PARAM(kind, shape) (static_cast<u32>((kind) | ((shape) << 8)))
+
+// Comportement du bloc (parametre de l'acteur)
 enum OrGhostKind {
     OR_GHOST_REAL = 2,    // vrai mur : toujours visible et solide
     OR_GHOST_FALSE = 0,   // faux mur : visible et solide... sauf avec le masque
     OR_GHOST_HIDDEN = 1,  // plateforme cachee : n'existe qu'avec le masque
+    OR_GHOST_CHEST = 3,   // coffre (modele du jeu, archive Dalways)
 };
 
 // Etat du masque (defini dans mod.cpp)
@@ -41,6 +51,8 @@ public:
     dBgW* mpCollider;
     f32 mGroundH;
     bool mRegistered;
+    const char* mArc;
+    int mShape;
 
     virtual ~maOrGhost_c();
     cPhs_Step create();
@@ -49,6 +61,7 @@ public:
     int Execute();
     int Draw();
     bool isSolid() const;
+    void fitToTarget();
     static int createHeapCallBack(fopAc_ac_c*);
 
     static s16 sProcName;

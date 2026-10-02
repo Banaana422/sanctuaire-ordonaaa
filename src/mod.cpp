@@ -1,16 +1,18 @@
-// Sanctuaire d'Ordona - prototype v0.3
+// Sanctuaire d'Ordona - v0.4
 //
-// Ce que fait ce mod :
-//  1. Dans la maison de Link (stage R_SP01, salle 4) il surveille la position de Link.
-//  2. Si Link est dans la zone du "miroir", un message s'affiche ; appuyer sur A
-//     lance le changement de stage vers le donjon.
-//  3. Dans le donjon, L + R + Z ensemble ramenent Link dans la cave.
+// Donjon de deux salles, construit avec des dalles du Palais du Crepuscule, dans un grand
+// espace vide au-dessus de la cave de Link. Pas de changement de stage : le miroir te
+// teleporte. Salle 1 : un coffre donne le Masque de Zant. Salle 2 : une enigme qui l'utilise.
 //
-// La position du miroir se regle EN JEU : tiens R et appuie sur Haut (croix directionnelle)
-// a l'endroit voulu dans la cave. La position est sauvegardee dans la config du mod.
+// Commandes :
+//   A pres du miroir (cave)  : entrer dans le donjon
+//   A pres du coffre         : ouvrir
+//   R + Gauche               : mettre / retirer le masque (une fois obtenu)
+//   L + R + Z                : revenir a la cave (secours)
+//   R + Bas                  : affiche stage / salle / position (diagnostic)
+//   R + Haut (dans la cave)  : replacer le miroir ici
 //
-// ATTENTION : non teste en jeu (voir README). Les valeurs marquees "A VERIFIER" sont des
-// hypotheses a confirmer avec les messages du journal (console Dusklight).
+// ATTENTION : non teste en jeu. Voir le README.
 
 #include "mods/service.hpp"
 #include "mods/svc/actor.h"
@@ -36,24 +38,26 @@ IMPORT_SERVICE(UiService, svc_ui);
 
 namespace {
 
-// ---- Reglages (A VERIFIER dans le journal du jeu) -------------------------------------------
-// Cave de Link : stage + salle ou se trouve le miroir.
+// ---- Cave de Link (releve en jeu) ------------------------------------------------------------
 constexpr const char* kPortalStage = "R_SP01";
-constexpr int kPortalRoom = 7;  // releve en jeu : cave de Link = R_SP01 salle 7
-constexpr float kPortalRadius = 120.0f;  // rayon d'activation (unites du jeu)
+constexpr int kPortalRoom = 7;
+constexpr float kPortalRadius = 120.0f;
+constexpr float kDefaultX = 85.0f, kDefaultY = -1082.0f, kDefaultZ = -948.0f;
 
-// Destination : on reutilise la Caverne des Epreuves (D_SB01) comme squelette de donjon.
-// Un vrai nouveau donjon (nouvelle geometrie) ne peut pas etre cree par un mod seul.
-constexpr const char* kDestStage = "D_SB01";
-constexpr int kDestPoint = 0;   // point d'entree  (A VERIFIER)
-constexpr int kDestRoom = 0;    // salle de depart (A VERIFIER)
-constexpr int kDestLayer = -1;  // -1 = calque par defaut
+// ---- Arene : tres loin et tres haut au-dessus de la cave -------------------------------------
+constexpr float kArenaDx = 20000.0f;
+constexpr float kArenaDy = 6000.0f;
+constexpr float kArenaFallMargin = 1500.0f;  // sous ce niveau, on remet Link au depart
 
-// Retour vers la cave de Link (A VERIFIER : le numero de point d'entree).
-constexpr int kReturnPoint = 0;
-constexpr int kReturnRoom = kPortalRoom;
-constexpr int kReturnLayer = -1;
-// ----------------------------------------------------------------------------------------------
+// ---- Dimensions du donjon (unites du jeu) ----------------------------------------------------
+constexpr float kFloorT = 60.0f;   // epaisseur du sol
+constexpr float kWallH = 500.0f;   // hauteur des murs
+constexpr float kWallT = 60.0f;    // epaisseur des murs
+
+// Points d'interaction (coordonnees locales a l'arene)
+constexpr float kChestX = 0.0f, kChestZ = -300.0f;
+constexpr float kGoalX = 0.0f, kGoalZ = 3250.0f;
+constexpr float kUseRadius = 220.0f;
 
 ConfigVarHandle g_varSet{};
 ConfigVarHandle g_varX{};
@@ -61,16 +65,22 @@ ConfigVarHandle g_varY{};
 ConfigVarHandle g_varZ{};
 
 bool g_portalSet = false;
-float g_px = 0.0f, g_py = 0.0f, g_pz = 0.0f;
+float g_px = kDefaultX, g_py = kDefaultY, g_pz = kDefaultZ;
+
 bool g_wasInZone = false;
-bool g_inSanctuary = false;
-int g_cooldown = 0;  // frames d'attente apres un warp
+bool g_hasMask = false;       // masque obtenu
+bool g_inArena = false;
+bool g_spawned = false;
+int g_roomFrames = 0;         // frames passees dans la cave
+int g_sinceSpawn = 0;         // frames depuis la creation du donjon
+int g_cooldown = 0;
+float g_ax = 0, g_ay = 0, g_az = 0;  // origine de l'arene (monde)
 
 void toast(const char* title, const char* body) {
     UiToastDesc desc = UI_TOAST_DESC_INIT;
     desc.title_rml = title;
     desc.body_rml = body;
-    desc.duration_ms = 3500;
+    desc.duration_ms = 4000;
     svc_ui->push_toast(mod_ctx, &desc);
 }
 
@@ -81,10 +91,12 @@ void loadConfig() {
     svc_config->get_float(mod_ctx, g_varX, &x);
     svc_config->get_float(mod_ctx, g_varY, &y);
     svc_config->get_float(mod_ctx, g_varZ, &z);
-    g_portalSet = set;
-    g_px = static_cast<float>(x);
-    g_py = static_cast<float>(y);
-    g_pz = static_cast<float>(z);
+    if (set) {
+        g_portalSet = true;
+        g_px = static_cast<float>(x);
+        g_py = static_cast<float>(y);
+        g_pz = static_cast<float>(z);
+    }
 }
 
 void savePortal(float x, float y, float z) {
@@ -105,31 +117,115 @@ bool registerVar(const char* name, ConfigVarType type, ConfigVarHandle* out) {
     return svc_config->register_var(mod_ctx, &desc, out) == MOD_OK;
 }
 
-
-// Fait apparaitre un bloc fantome devant Link.
-void spawnGhost(int kind, const cXyz& pos, int room, s16 angleY, const cXyz& scale) {
-    csXyz ang(0, angleY, 0);
-    cXyz p = pos;
-    cXyz sc = scale;
-    fopAcM_create(maOrGhost_c::sProcName, static_cast<u32>(kind), &p, room, &ang, &sc, -1);
+void teleport(fopAc_ac_c* p, float x, float y, float z, s16 yaw) {
+    p->current.pos.set(x, y, z);
+    p->old.pos = p->current.pos;
+    p->speed.set(0.0f, 0.0f, 0.0f);
+    p->speedF = 0.0f;
+    p->current.angle.y = yaw;
+    p->shape_angle.y = yaw;
 }
 
-// Salle de test : un vrai mur, un faux mur et une plateforme cachee en ligne devant Link.
-void spawnTestRoom(fopAc_ac_c* player, int room) {
-    const cXyz base = player->current.pos;
-    const s16 yaw = player->shape_angle.y;
-    const float a = static_cast<float>(yaw) * (3.14159265f / 32768.0f);
-    const float fx = std::sin(a), fz = std::cos(a);  // devant
-    const float rx = fz, rz = -fx;                   // droite
-    const float dist = 500.0f, gap = 450.0f;
+// ---- Construction du donjon -------------------------------------------------------------------
+int g_room = 0;
 
-    auto at = [&](float side) {
-        return cXyz(base.x + fx * dist + rx * side, base.y, base.z + fz * dist + rz * side);
-    };
-    spawnGhost(OR_GHOST_REAL, at(-gap), room, yaw, cXyz(1.0f, 1.0f, 1.0f));
-    spawnGhost(OR_GHOST_FALSE, at(0.0f), room, yaw, cXyz(1.0f, 1.0f, 1.0f));
-    spawnGhost(OR_GHOST_HIDDEN, at(gap), room, yaw, cXyz(1.0f, 0.4f, 1.0f));
-    mods::log::info("Salle de test creee devant Link (salle {})", room);
+// cx/cz = centre, by = bas (coordonnees LOCALES), sx/sy/sz = taille voulue.
+void block(int shape, int kind, float cx, float by, float cz, float sx, float sy, float sz) {
+    cXyz pos(g_ax + cx, g_ay + by, g_az + cz);
+    cXyz size(sx, sy, sz);
+    csXyz ang(0, 0, 0);
+    const auto id = fopAcM_create(maOrGhost_c::sProcName, OR_PARAM(kind, shape), &pos, g_room, &ang,
+        &size, -1);
+    if (id == fpcM_ERROR_PROCESS_ID_e) {
+        mods::log::error("Creation du bloc impossible (shape {} kind {})", shape, kind);
+    }
+}
+
+// Sol : de x0 a x1, de z0 a z1 ; le dessus est a y = 0 local.
+void floorSlab(float x0, float x1, float z0, float z1) {
+    block(OR_SHAPE_SLAB, OR_GHOST_REAL, 0.5f * (x0 + x1), -kFloorT, 0.5f * (z0 + z1), x1 - x0,
+        kFloorT, z1 - z0);
+}
+
+// Mur : de x0 a x1, de z0 a z1 ; du sol vers le haut.
+void wall(int kind, float x0, float x1, float z0, float z1) {
+    block(OR_SHAPE_SLAB, kind, 0.5f * (x0 + x1), 0.0f, 0.5f * (z0 + z1), x1 - x0, kWallH, z1 - z0);
+}
+
+// Pierre cachee (visible et solide seulement avec le masque).
+void hiddenStone(float cx, float cz, float size) {
+    block(OR_SHAPE_SLAB, OR_GHOST_HIDDEN, cx, -kFloorT, cz, size, kFloorT, size);
+}
+
+void buildDungeon(int room) {
+    g_room = room;
+    g_ax = g_px + kArenaDx;
+    g_ay = g_py + kArenaDy;
+    g_az = g_pz;
+
+    const int R = OR_GHOST_REAL;
+    const int F = OR_GHOST_FALSE;
+
+    // ===== SALLE 1 : x [-600, 600], z [-600, 600] =====
+    floorSlab(-600, 600, -600, 600);
+    wall(R, -660, 660, -660, -600);   // mur du fond
+    wall(R, -660, -600, -600, 600);   // mur gauche
+    wall(R, 600, 660, -600, 600);     // mur droit
+    wall(R, -660, -160, 600, 660);    // mur avant, a gauche de la porte
+    wall(R, 160, 660, 600, 660);      // mur avant, a droite de la porte
+    wall(F, -160, 160, 600, 660);     // FAUSSE porte : disparait avec le masque
+
+    // coffre (modele du jeu)
+    block(OR_SHAPE_CHEST, R, kChestX, 0.0f, kChestZ, 1.4f, 1.4f, 1.4f);
+
+    // ===== COULOIR : x [-160, 160], z [600, 1200] =====
+    floorSlab(-160, 160, 600, 1200);
+    wall(R, -220, -160, 660, 1200);
+    wall(R, 160, 220, 660, 1200);
+
+    // ===== SALLE 2 : x [-700, 700], z [1200, 3000], un gouffre entre z=1700 et z=2100 =====
+    floorSlab(-700, 700, 1200, 1700);
+    floorSlab(-700, 700, 2100, 3000);
+    hiddenStone(0, 1800, 180);        // pierres visibles seulement avec le masque
+    hiddenStone(0, 2000, 180);
+    wall(R, -760, -700, 1200, 3060);  // mur gauche
+    wall(R, 700, 760, 1200, 3060);    // mur droit
+    wall(R, -760, -160, 1200, 1260);  // mur avant, a gauche du couloir
+    wall(R, 160, 760, 1200, 1260);    // mur avant, a droite du couloir
+    wall(R, -760, -120, 3000, 3060);  // mur du fond, a gauche
+    wall(R, 120, 760, 3000, 3060);    // mur du fond, a droite
+    wall(F, -120, 120, 3000, 3060);   // FAUSSE porte du fond : disparait avec le masque
+
+    // ===== ALCOVE FINALE : x [-120, 120], z [3000, 3400] =====
+    floorSlab(-180, 180, 3000, 3460);
+    wall(R, -180, -120, 3000, 3460);
+    wall(R, 120, 180, 3000, 3460);
+    wall(R, -180, 180, 3400, 3460);
+
+    g_spawned = true;
+    g_sinceSpawn = 0;
+    mods::log::info("Donjon cree : origine arene ({:.0f}, {:.0f}, {:.0f}), salle {}", g_ax, g_ay,
+        g_az, room);
+}
+
+void enterArena(fopAc_ac_c* player) {
+    teleport(player, g_ax, g_ay + 50.0f, g_az - 450.0f, 0);
+    g_inArena = true;
+    g_cooldown = 30;
+    toast("Le miroir t'avale...", "Fouille la salle. Un coffre brille au centre.");
+}
+
+void leaveArena(fopAc_ac_c* player, const char* title, const char* body) {
+    teleport(player, g_px, g_py + 20.0f, g_pz + 150.0f, 0);
+    g_inArena = false;
+    g_wasInZone = true;  // evite de re-declencher le message tout de suite
+    g_cooldown = 60;
+    toast(title, body);
+}
+
+float dist2D(const cXyz& p, float x, float z) {
+    const float dx = p.x - x, dz = p.z - z;
+    return std::sqrt(dx * dx + dz * dz);
 }
 
 }  // namespace
@@ -152,15 +248,8 @@ MOD_EXPORT ModResult mod_initialize(ModError*) {
         return MOD_ERROR;
     }
     loadConfig();
-    if (!g_portalSet) {
-        // Position relevee en jeu devant le miroir ; R + Haut permet de la changer.
-        g_px = 85.0f;
-        g_py = -1082.0f;
-        g_pz = -948.0f;
-        g_portalSet = true;
-    }
-    mods::log::info("Sanctuaire d'Ordona charge. Miroir {}.",
-        "position du miroir chargee");
+    mods::log::info("Sanctuaire d'Ordona v0.4 charge (miroir en {:.0f}, {:.0f}, {:.0f})", g_px,
+        g_py, g_pz);
     return MOD_OK;
 }
 
@@ -174,7 +263,6 @@ MOD_EXPORT ModResult mod_update(ModError*) {
     if (player == nullptr || dComIfGp_event_runCheck()) {
         return MOD_OK;
     }
-
     const char* stage = dComIfGp_getStartStageName();
     if (stage == nullptr) {
         return MOD_OK;
@@ -182,87 +270,107 @@ MOD_EXPORT ModResult mod_update(ModError*) {
     const int room = dComIfGp_roomControl_getStayNo();
     const u32 held = mDoCPd_c::getHold(0);
     const u32 trig = mDoCPd_c::getTrig(0);
+    const cXyz& pos = player->current.pos;
 
-    // ---- Diagnostic : R + Bas affiche stage / salle / position a l'ecran ----------------------
+    // ---- Diagnostic : R + Bas -----------------------------------------------------------------
     if ((held & PAD_TRIGGER_R) && (trig & PAD_BUTTON_DOWN)) {
         char buf[200];
         std::snprintf(buf, sizeof(buf), "stage %s, salle %d  |  x=%.0f y=%.0f z=%.0f", stage, room,
-            player->current.pos.x, player->current.pos.y, player->current.pos.z);
+            pos.x, pos.y, pos.z);
         toast("Position actuelle", buf);
-        mods::log::info("DIAG stage={} salle={} pos=({:.1f},{:.1f},{:.1f})", stage, room,
-            player->current.pos.x, player->current.pos.y, player->current.pos.z);
+        mods::log::info("DIAG stage={} salle={} pos=({:.1f},{:.1f},{:.1f})", stage, room, pos.x,
+            pos.y, pos.z);
         return MOD_OK;
     }
 
-    // ---- Masque de Zant : R + Gauche = equiper / retirer -------------------------------------
+    // ---- Masque de Zant : R + Gauche ----------------------------------------------------------
     if ((held & PAD_TRIGGER_R) && (trig & PAD_BUTTON_LEFT)) {
-        g_orMask = !g_orMask;
-        toast(g_orMask ? "Masque equipe" : "Masque retire",
-            g_orMask ? "Les faux murs disparaissent, les passages caches apparaissent."
-                     : "Retour a la vue normale.");
-        return MOD_OK;
-    }
-
-    // ---- Salle de test : R + Droite = fait apparaitre 3 blocs devant Link -------------------
-    if ((held & PAD_TRIGGER_R) && (trig & PAD_BUTTON_RIGHT)) {
-        spawnTestRoom(player, room);
-        toast("Salle de test", "Gauche : vrai mur. Centre : faux mur. Droite : plateforme cachee.");
-        return MOD_OK;
-    }
-
-    // ---- Dans le donjon : retour avec L + R + Z -------------------------------------------
-    if (std::strcmp(stage, kDestStage) == 0) {
-        if (g_inSanctuary && (held & PAD_TRIGGER_L) && (held & PAD_TRIGGER_R) &&
-            (trig & PAD_TRIGGER_Z))
-        {
-            mods::log::info("Retour vers {} (point {}, salle {})", kPortalStage, kReturnPoint,
-                kReturnRoom);
-            dComIfGp_setNextStage(kPortalStage, kReturnPoint, kReturnRoom, kReturnLayer);
-            g_inSanctuary = false;
-            g_cooldown = 120;
+        if (!g_hasMask) {
+            toast("Pas de masque", "Tu ne possedes pas encore le masque.");
+        } else {
+            g_orMask = !g_orMask;
+            toast(g_orMask ? "Masque equipe" : "Masque retire",
+                g_orMask ? "Les faux murs disparaissent, les passages caches apparaissent."
+                         : "Retour a la vue normale.");
         }
         return MOD_OK;
     }
-    g_inSanctuary = false;
 
-    // ---- Dans la cave de Link --------------------------------------------------------------
-    if (std::strcmp(stage, kPortalStage) != 0 || room != kPortalRoom) {
+    // ---- Si on quitte la cave (autre stage), tout est reinitialise ----------------------------
+    if (std::strcmp(stage, kPortalStage) != 0) {
+        g_inArena = false;
+        g_spawned = false;
+        g_roomFrames = 0;
         g_wasInZone = false;
         return MOD_OK;
     }
 
-    const cXyz& pos = player->current.pos;
+    // ============================== DANS LE DONJON =============================================
+    if (g_inArena) {
+        // Retour de secours : L + R + Z
+        if ((held & PAD_TRIGGER_L) && (held & PAD_TRIGGER_R) && (trig & PAD_TRIGGER_Z)) {
+            leaveArena(player, "Retour", "Tu es revenu dans la cave.");
+            return MOD_OK;
+        }
+        // Chute : on remet Link au depart
+        if (pos.y < g_ay - kArenaFallMargin) {
+            teleport(player, g_ax, g_ay + 50.0f, g_az - 450.0f, 0);
+            toast("Tu es tombe", "Retour au debut du donjon.");
+            return MOD_OK;
+        }
+        // Coffre
+        if (!g_hasMask && dist2D(pos, g_ax + kChestX, g_az + kChestZ) < kUseRadius &&
+            (trig & PAD_BUTTON_A))
+        {
+            g_hasMask = true;
+            toast("Masque de Zant obtenu !", "R + Gauche : mettre ou retirer le masque.");
+            return MOD_OK;
+        }
+        // Sortie du donjon
+        if (dist2D(pos, g_ax + kGoalX, g_az + kGoalZ) < kUseRadius && (trig & PAD_BUTTON_A)) {
+            leaveArena(player, "Donjon termine !", "Bravo, tu as resolu l'enigme.");
+            return MOD_OK;
+        }
+        return MOD_OK;
+    }
 
-    // Calibration : R maintenu + Haut sur la croix directionnelle.
+    // ============================== DANS LA CAVE ===============================================
+    if (room != kPortalRoom) {
+        g_roomFrames = 0;
+        g_spawned = false;
+        g_wasInZone = false;
+        return MOD_OK;
+    }
+
+    // Le donjon se construit ~1 s apres l'arrivee dans la cave.
+    ++g_roomFrames;
+    if (!g_spawned && g_roomFrames > 60) {
+        buildDungeon(room);
+    }
+    if (g_spawned) {
+        ++g_sinceSpawn;
+    }
+
+    // Calibration du miroir : R + Haut
     if ((held & PAD_TRIGGER_R) && (trig & PAD_BUTTON_UP)) {
         savePortal(pos.x, pos.y, pos.z);
-        mods::log::info("Miroir place en ({:.1f}, {:.1f}, {:.1f}) dans {} salle {}", pos.x, pos.y,
-            pos.z, stage, room);
-        toast("Miroir place", "Position enregistree. Reviens près du miroir et appuie sur A.");
+        toast("Miroir place", "Position enregistree (le donjon sera reconstruit a la prochaine visite).");
         return MOD_OK;
     }
 
-    if (!g_portalSet) {
-        return MOD_OK;
-    }
-
-    const float dx = pos.x - g_px;
-    const float dz = pos.z - g_pz;
-    const float dy = pos.y - g_py;
-    const bool inZone = (dx * dx + dz * dz) < (kPortalRadius * kPortalRadius) &&
-                        std::fabs(dy) < 200.0f;
-
+    const float d = dist2D(pos, g_px, g_pz);
+    const bool inZone = d < kPortalRadius && std::fabs(pos.y - g_py) < 200.0f;
     if (inZone && !g_wasInZone) {
         toast("Le miroir brille...", "Appuie sur A pour entrer.");
     }
     g_wasInZone = inZone;
 
     if (inZone && (trig & PAD_BUTTON_A)) {
-        mods::log::info("Entree dans le sanctuaire : {} point {} salle {}", kDestStage,
-            kDestPoint, kDestRoom);
-        dComIfGp_setNextStage(kDestStage, kDestPoint, kDestRoom, kDestLayer);
-        g_inSanctuary = true;
-        g_cooldown = 120;
+        if (!g_spawned || g_sinceSpawn < 240) {
+            toast("Le miroir se prepare...", "Reessaie dans quelques secondes.");
+        } else {
+            enterArena(player);
+        }
     }
     return MOD_OK;
 }

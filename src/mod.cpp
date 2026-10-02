@@ -29,6 +29,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <vector>
 
 DEFINE_MOD();
 IMPORT_SERVICE(LogService, svc_log);
@@ -46,7 +47,7 @@ constexpr float kDefaultX = 85.0f, kDefaultY = -1082.0f, kDefaultZ = -948.0f;
 
 // ---- Arene : tres loin et tres haut au-dessus de la cave -------------------------------------
 constexpr float kArenaDx = 20000.0f;
-constexpr float kArenaDy = 6000.0f;
+constexpr float kArenaDy = 3000.0f;
 constexpr float kArenaFallMargin = 1500.0f;  // sous ce niveau, on remet Link au depart
 
 // ---- Dimensions du donjon (unites du jeu) ----------------------------------------------------
@@ -129,16 +130,43 @@ void teleport(fopAc_ac_c* p, float x, float y, float z, s16 yaw) {
 // ---- Construction du donjon -------------------------------------------------------------------
 int g_room = 0;
 
+struct BlockDef {
+    int shape, kind;
+    float cx, by, cz, sx, sy, sz;
+};
+std::vector<BlockDef> g_queue;
+size_t g_next = 0;      // prochain bloc a creer
+int g_pumpTimer = 0;
+
 // cx/cz = centre, by = bas (coordonnees LOCALES), sx/sy/sz = taille voulue.
+// Le bloc est mis en file d'attente : il est cree progressivement (voir pumpQueue).
 void block(int shape, int kind, float cx, float by, float cz, float sx, float sy, float sz) {
-    cXyz pos(g_ax + cx, g_ay + by, g_az + cz);
-    cXyz size(sx, sy, sz);
-    csXyz ang(0, 0, 0);
-    const auto id = fopAcM_create(maOrGhost_c::sProcName, OR_PARAM(kind, shape), &pos, g_room, &ang,
-        &size, -1);
-    if (id == fpcM_ERROR_PROCESS_ID_e) {
-        mods::log::error("Creation du bloc impossible (shape {} kind {})", shape, kind);
+    g_queue.push_back({shape, kind, cx, by, cz, sx, sy, sz});
+}
+
+void pumpQueue() {
+    if (g_next >= g_queue.size()) {
+        return;
     }
+    if (++g_pumpTimer < 6) {
+        return;
+    }
+    g_pumpTimer = 0;
+    for (int n = 0; n < 2 && g_next < g_queue.size(); ++n, ++g_next) {
+        const BlockDef& b = g_queue[g_next];
+        cXyz pos(g_ax + b.cx, g_ay + b.by, g_az + b.cz);
+        cXyz size(b.sx, b.sy, b.sz);
+        csXyz ang(0, 0, 0);
+        const auto id = fopAcM_create(maOrGhost_c::sProcName, OR_PARAM(b.kind, b.shape), &pos,
+            g_room, &ang, &size, -1);
+        mods::log::info("Bloc {}/{} demande (forme {}, type {}) id={}", g_next + 1, g_queue.size(),
+            b.shape, b.kind, static_cast<unsigned>(id));
+    }
+}
+
+bool dungeonReady() {
+    return g_spawned && g_next >= g_queue.size() &&
+           g_orBlocksReady >= static_cast<int>(g_queue.size());
 }
 
 // Sol : de x0 a x1, de z0 a z1 ; le dessus est a y = 0 local.
@@ -159,6 +187,9 @@ void hiddenStone(float cx, float cz, float size) {
 
 void buildDungeon(int room) {
     g_room = room;
+    g_queue.clear();
+    g_next = 0;
+    g_pumpTimer = 0;
     g_ax = g_px + kArenaDx;
     g_ay = g_py + kArenaDy;
     g_az = g_pz;
@@ -175,8 +206,8 @@ void buildDungeon(int room) {
     wall(R, 160, 660, 600, 660);      // mur avant, a droite de la porte
     wall(F, -160, 160, 600, 660);     // FAUSSE porte : disparait avec le masque
 
-    // coffre (modele du jeu)
-    block(OR_SHAPE_CHEST, R, kChestX, 0.0f, kChestZ, 1.4f, 1.4f, 1.4f);
+    // "coffre" : pour l'instant un socle de pierre (le vrai modele de coffre viendra apres)
+    block(OR_SHAPE_SLAB, R, kChestX, 0.0f, kChestZ, 140.0f, 90.0f, 140.0f);
 
     // ===== COULOIR : x [-160, 160], z [600, 1200] =====
     floorSlab(-160, 160, 600, 1200);
@@ -204,8 +235,8 @@ void buildDungeon(int room) {
 
     g_spawned = true;
     g_sinceSpawn = 0;
-    mods::log::info("Donjon cree : origine arene ({:.0f}, {:.0f}, {:.0f}), salle {}", g_ax, g_ay,
-        g_az, room);
+    mods::log::info("Donjon planifie : {} blocs, origine ({:.0f}, {:.0f}, {:.0f}), salle {}",
+        g_queue.size(), g_ax, g_ay, g_az, room);
 }
 
 void enterArena(fopAc_ac_c* player) {
@@ -348,7 +379,15 @@ MOD_EXPORT ModResult mod_update(ModError*) {
         buildDungeon(room);
     }
     if (g_spawned) {
-        ++g_sinceSpawn;
+        const int before = g_orBlocksReady;
+        pumpQueue();
+        if (g_orBlocksReady != before || dungeonReady()) {
+            static int lastLogged = -1;
+            if (g_orBlocksReady != lastLogged) {
+                lastLogged = g_orBlocksReady;
+                mods::log::info("Blocs prets : {}/{}", g_orBlocksReady, g_queue.size());
+            }
+        }
     }
 
     // Calibration du miroir : R + Haut
@@ -366,9 +405,13 @@ MOD_EXPORT ModResult mod_update(ModError*) {
     g_wasInZone = inZone;
 
     if (inZone && (trig & PAD_BUTTON_A)) {
-        if (!g_spawned || g_sinceSpawn < 240) {
-            toast("Le miroir se prepare...", "Reessaie dans quelques secondes.");
+        if (!dungeonReady()) {
+            char buf[120];
+            std::snprintf(buf, sizeof(buf), "Construction : %d/%d blocs. Reessaie dans un instant.",
+                g_orBlocksReady, static_cast<int>(g_queue.size()));
+            toast("Le miroir se prepare...", buf);
         } else {
+            mods::log::info("Teleportation vers l'arene");
             enterArena(player);
         }
     }

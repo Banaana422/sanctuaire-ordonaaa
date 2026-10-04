@@ -1,0 +1,7 @@
+{
+  "id": "fr.ordona.sanctuaire",
+  "name": "Donjons du Crepuscule",
+  "version": "@PROJECT_VERSION@",
+  "author": "Alban",
+  "description": "Teleporteurs vers les 3 premiers temples en mode difficile, menu F1 de debogage et de spawn de monstres."
+}

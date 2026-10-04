@@ -45,6 +45,13 @@ constexpr int kPortalRoom = 7;
 constexpr float kPortalRadius = 120.0f;
 constexpr float kDefaultX = 85.0f, kDefaultY = -1082.0f, kDefaultZ = -948.0f;
 
+// ---- TP natif (secours) : warp du jeu vers un stage existant (Caverne des Epreuves) ---------
+constexpr const char* kAltStage = "D_SB01";
+constexpr int kAltPoint = 0;
+constexpr int kAltRoom = 0;
+constexpr int kAltLayer = -1;
+constexpr int kBackPoint = 0;  // point d'arrivee dans la cave au retour (A VERIFIER)
+
 // ---- Arene : tres loin et tres haut au-dessus de la cave -------------------------------------
 constexpr float kArenaDx = 20000.0f;
 constexpr float kArenaDy = 3000.0f;
@@ -279,7 +286,7 @@ MOD_EXPORT ModResult mod_initialize(ModError*) {
         return MOD_ERROR;
     }
     loadConfig();
-    mods::log::info("Sanctuaire d'Ordona v0.4 charge (miroir en {:.0f}, {:.0f}, {:.0f})", g_px,
+    mods::log::info("Sanctuaire d'Ordona v0.5 charge (miroir en {:.0f}, {:.0f}, {:.0f})", g_px,
         g_py, g_pz);
     return MOD_OK;
 }
@@ -323,6 +330,16 @@ MOD_EXPORT ModResult mod_update(ModError*) {
             toast(g_orMask ? "Masque equipe" : "Masque retire",
                 g_orMask ? "Les faux murs disparaissent, les passages caches apparaissent."
                          : "Retour a la vue normale.");
+        }
+        return MOD_OK;
+    }
+
+    // ---- TP natif : retour depuis la Caverne des Epreuves avec L + R + Z -----------------------
+    if (std::strcmp(stage, kAltStage) == 0) {
+        if ((held & PAD_TRIGGER_L) && (held & PAD_TRIGGER_R) && (trig & PAD_TRIGGER_Z)) {
+            mods::log::info("TP natif : retour vers {} salle {}", kPortalStage, kPortalRoom);
+            dComIfGp_setNextStage(kPortalStage, kBackPoint, kPortalRoom, -1);
+            g_cooldown = 120;
         }
         return MOD_OK;
     }
@@ -373,11 +390,8 @@ MOD_EXPORT ModResult mod_update(ModError*) {
         return MOD_OK;
     }
 
-    // Le donjon se construit ~1 s apres l'arrivee dans la cave.
+    // Le donjon ne se construit QUE quand on utilise le miroir (voir plus bas).
     ++g_roomFrames;
-    if (!g_spawned && g_roomFrames > 60) {
-        buildDungeon(room);
-    }
     if (g_spawned) {
         const int before = g_orBlocksReady;
         pumpQueue();
@@ -399,28 +413,4 @@ MOD_EXPORT ModResult mod_update(ModError*) {
 
     const float d = dist2D(pos, g_px, g_pz);
     const bool inZone = d < kPortalRadius && std::fabs(pos.y - g_py) < 200.0f;
-    if (inZone && !g_wasInZone) {
-        toast("Le miroir brille...", "Appuie sur A pour entrer.");
-    }
-    g_wasInZone = inZone;
-
-    if (inZone && (trig & PAD_BUTTON_A)) {
-        if (!dungeonReady()) {
-            char buf[120];
-            std::snprintf(buf, sizeof(buf), "Construction : %d/%d blocs. Reessaie dans un instant.",
-                g_orBlocksReady, static_cast<int>(g_queue.size()));
-            toast("Le miroir se prepare...", buf);
-        } else {
-            mods::log::info("Teleportation vers l'arene");
-            enterArena(player);
-        }
-    }
-    return MOD_OK;
-}
-
-MOD_EXPORT ModResult mod_shutdown(ModError*) {
-    mods::log::info("Sanctuaire d'Ordona decharge");
-    return MOD_OK;
-}
-
-}  // extern "C"
+    if (

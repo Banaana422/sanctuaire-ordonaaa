@@ -15,11 +15,18 @@ struct ShapeDef {
     int dzb;
     u32 heap;
     bool autoSize;
+    u32 mdlFlag;   // 1er parametre de mDoExt_J3DModel__create
+    u32 dlFlag;    // 2eme parametre
+    int tevType;   // type d'eclairage de settingTevStruct
 };
 const ShapeDef kShapes[OR_SHAPE_COUNT] = {
-    {"Wrock", dRes_INDEX_WROCK_BMD_WROCK_e, dRes_INDEX_WROCK_DZB_WROCK_e, 0x6000, false},
-    {"L8Lift", dRes_INDEX_L8LIFT_BMD_LV8_LIFTX_e, dRes_INDEX_L8LIFT_DZB_LV8_LIFTX_e, 0x8000, true},
-    {"Tbox2", dRes_INDEX_TBOX2_BMD_BOXA_e, dRes_INDEX_TBOX2_DZB_BOXAC_e, 0x8000, false},
+    {"Wrock", dRes_INDEX_WROCK_BMD_WROCK_e, dRes_INDEX_WROCK_DZB_WROCK_e, 0x6000, false, 0x80000,
+        0x11000084, 0x20},
+    // Dalle du Palais du Crepuscule : parametres identiques a ceux de daL8Lift_c du jeu.
+    {"L8Lift", dRes_INDEX_L8LIFT_BMD_LV8_LIFTX_e, dRes_INDEX_L8LIFT_DZB_LV8_LIFTX_e, 0x8000, true,
+        0, 0x11000284, 16},
+    {"Tbox2", dRes_INDEX_TBOX2_BMD_BOXA_e, dRes_INDEX_TBOX2_DZB_BOXAC_e, 0x8000, false, 0x80000,
+        0x11000084, 0x20},
 };
 }  // namespace
 
@@ -96,14 +103,19 @@ cPhs_Step maOrGhost_c::create() {
 
     cPhs_Step step = dComIfG_resLoad(&mPhase, sd.arc);
     if (step == cPhs_COMPLEATE_e) {
+        orTrace("archive charge, forme", mShape, static_cast<int>(parameters & 0xFF));
         if (!fopAcM_entrySolidHeap(this, createHeapCallBack, sd.heap)) {
+            orTrace("ECHEC creation du tas / modele, forme", mShape);
             return cPhs_ERROR_e;
         }
+        orTrace("modele et collision crees");
         fopAcM_SetMtx(this, mpModel->getBaseTRMtx());
         fitToTarget();
+        orTrace("taille ajustee");
         Execute();
         mCounted = true;
         ++g_orBlocksReady;
+        orTrace("bloc pret, total", g_orBlocksReady);
     }
     return step;
 }
@@ -114,7 +126,7 @@ int maOrGhost_c::CreateHeap() {
     if (model_data == NULL) {
         return 0;
     }
-    mpModel = mDoExt_J3DModel__create(model_data, 0x80000, 0x11000084);
+    mpModel = mDoExt_J3DModel__create(model_data, sd.mdlFlag, sd.dlFlag);
     if (mpModel == NULL) {
         return 0;
     }
@@ -172,7 +184,7 @@ int maOrGhost_c::Draw() {
     if (!isSolid()) {
         return 1;  // invisible
     }
-    g_env_light.settingTevStruct(0x20, &current.pos, &tevStr);
+    g_env_light.settingTevStruct(kShapes[mShape].tevType, &current.pos, &tevStr);
     g_env_light.setLightTevColorType_MAJI(mpModel, &tevStr);
     dComIfGd_setListBG();
     mDoExt_modelUpdateDL(mpModel);

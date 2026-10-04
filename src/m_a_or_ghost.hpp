@@ -39,6 +39,7 @@ enum OrGhostKind {
 
 // Etat du masque (defini dans mod.cpp)
 extern bool g_orMask;
+void orTrace(const char* what, int a = 0, int b = 0);  // ecrit dans le journal (defini dans mod.cpp)
 extern int g_orBlocksReady;  // nombre de blocs completement crees
 
 class maOrGhost_c : public fopAc_ac_c {

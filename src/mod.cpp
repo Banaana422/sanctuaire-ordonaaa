@@ -64,7 +64,7 @@ constexpr float kWallT = 60.0f;    // epaisseur des murs
 
 // Points d'interaction (coordonnees locales a l'arene)
 constexpr float kChestX = 0.0f, kChestZ = -300.0f;
-constexpr float kGoalX = 0.0f, kGoalZ = 3250.0f;
+constexpr float kGoalX = 0.0f, kGoalZ = 2600.0f;
 constexpr float kUseRadius = 220.0f;
 
 ConfigVarHandle g_varSet{};
@@ -203,42 +203,39 @@ void buildDungeon(int room) {
 
     const int R = OR_GHOST_REAL;
     const int F = OR_GHOST_FALSE;
+    const int H = OR_GHOST_HIDDEN;
 
-    // ===== SALLE 1 : x [-600, 600], z [-600, 600] =====
-    floorSlab(-600, 600, -600, 600);
-    wall(R, -660, 660, -660, -600);   // mur du fond
-    wall(R, -660, -600, -600, 600);   // mur gauche
-    wall(R, 600, 660, -600, 600);     // mur droit
-    wall(R, -660, -160, 600, 660);    // mur avant, a gauche de la porte
-    wall(R, 160, 660, 600, 660);      // mur avant, a droite de la porte
-    wall(F, -160, 160, 600, 660);     // FAUSSE porte : disparait avec le masque
+    // Le donjon est un long couloir (axe z), 13 blocs seulement (la memoire du jeu est limitee).
+    //
+    //  z -600..600   SALLE 1 : coffre (masque). Mur avant = FAUX mur (disparait avec le masque).
+    //  z  660..1160  SALLE 2 : entree
+    //  z 1160..1560  GOUFFRE 1 : pierres visibles/solides seulement AVEC le masque
+    //  z 1560..1900  ILOT central (sol normal) : on peut y changer de masque
+    //  z 1900..2300  GOUFFRE 2 : pierres solides seulement SANS le masque
+    //  z 2300..2800  SALLE FINALE : alcove de sortie
+    //
+    // Cote : x entre -600 et 600.
 
-    // "coffre" : pour l'instant un socle de pierre (le vrai modele de coffre viendra apres)
+    // --- sols (le dessus est a y = 0) ---
+    floorSlab(-600, 600, -600, 1160);    // salle 1 + debut salle 2
+    floorSlab(-600, 600, 1560, 1900);    // ilot
+    floorSlab(-600, 600, 2300, 2800);    // salle finale
+
+    // --- pierres des gouffres ---
+    hiddenStone(0, 1250, 200);           // gouffre 1 : AVEC le masque
+    hiddenStone(0, 1470, 200);
+    block(OR_SHAPE_SLAB, F, 0, -kFloorT, 1990, 200, kFloorT, 200);  // gouffre 2 : SANS le masque
+    block(OR_SHAPE_SLAB, F, 0, -kFloorT, 2210, 200, kFloorT, 200);
+
+    // --- murs ---
+    wall(R, -660, -600, -660, 2860);     // mur gauche (toute la longueur)
+    wall(R, 600, 660, -660, 2860);       // mur droit
+    wall(R, -660, 660, -660, -600);      // fond de la salle 1
+    wall(R, -660, 660, 2800, 2860);      // fond de la salle finale
+    wall(F, -600, 600, 600, 660);        // FAUX mur entre les salles 1 et 2
+
+    // --- "coffre" : socle de pierre ---
     block(OR_SHAPE_SLAB, R, kChestX, 0.0f, kChestZ, 140.0f, 90.0f, 140.0f);
-
-    // ===== COULOIR : x [-160, 160], z [600, 1200] =====
-    floorSlab(-160, 160, 600, 1200);
-    wall(R, -220, -160, 660, 1200);
-    wall(R, 160, 220, 660, 1200);
-
-    // ===== SALLE 2 : x [-700, 700], z [1200, 3000], un gouffre entre z=1700 et z=2100 =====
-    floorSlab(-700, 700, 1200, 1700);
-    floorSlab(-700, 700, 2100, 3000);
-    hiddenStone(0, 1800, 180);        // pierres visibles seulement avec le masque
-    hiddenStone(0, 2000, 180);
-    wall(R, -760, -700, 1200, 3060);  // mur gauche
-    wall(R, 700, 760, 1200, 3060);    // mur droit
-    wall(R, -760, -160, 1200, 1260);  // mur avant, a gauche du couloir
-    wall(R, 160, 760, 1200, 1260);    // mur avant, a droite du couloir
-    wall(R, -760, -120, 3000, 3060);  // mur du fond, a gauche
-    wall(R, 120, 760, 3000, 3060);    // mur du fond, a droite
-    wall(F, -120, 120, 3000, 3060);   // FAUSSE porte du fond : disparait avec le masque
-
-    // ===== ALCOVE FINALE : x [-120, 120], z [3000, 3400] =====
-    floorSlab(-180, 180, 3000, 3460);
-    wall(R, -180, -120, 3000, 3460);
-    wall(R, 120, 180, 3000, 3460);
-    wall(R, -180, 180, 3400, 3460);
 
     g_spawned = true;
     g_sinceSpawn = 0;
@@ -267,6 +264,10 @@ float dist2D(const cXyz& p, float x, float z) {
 }
 
 }  // namespace
+
+void orTrace(const char* what, int a, int b) {
+    mods::log::info("[orghost] {} {} {}", what, a, b);
+}
 
 extern "C" {
 

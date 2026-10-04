@@ -413,4 +413,39 @@ MOD_EXPORT ModResult mod_update(ModError*) {
 
     const float d = dist2D(pos, g_px, g_pz);
     const bool inZone = d < kPortalRadius && std::fabs(pos.y - g_py) < 200.0f;
-    if (
+    if (inZone && !g_wasInZone) {
+        toast("Le miroir brille...", "A : donjon.  Z + A : TP vers la Caverne des Epreuves.");
+    }
+    g_wasInZone = inZone;
+
+    if (inZone && (trig & PAD_BUTTON_A) && (held & PAD_TRIGGER_Z)) {
+        mods::log::info("TP natif vers {} point {} salle {}", kAltStage, kAltPoint, kAltRoom);
+        dComIfGp_setNextStage(kAltStage, kAltPoint, kAltRoom, kAltLayer);
+        g_cooldown = 120;
+        return MOD_OK;
+    }
+
+    if (inZone && (trig & PAD_BUTTON_A)) {
+        if (!g_spawned) {
+            mods::log::info("Construction du donjon demandee");
+            buildDungeon(room);
+        }
+        if (!dungeonReady()) {
+            char buf[120];
+            std::snprintf(buf, sizeof(buf), "Construction : %d/%d blocs. Reessaie dans un instant.",
+                g_orBlocksReady, static_cast<int>(g_queue.size()));
+            toast("Le miroir se prepare...", buf);
+        } else {
+            mods::log::info("Teleportation vers l'arene");
+            enterArena(player);
+        }
+    }
+    return MOD_OK;
+}
+
+MOD_EXPORT ModResult mod_shutdown(ModError*) {
+    mods::log::info("Sanctuaire d'Ordona decharge");
+    return MOD_OK;
+}
+
+}  // extern "C"

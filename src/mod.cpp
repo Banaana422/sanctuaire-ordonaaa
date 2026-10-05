@@ -1,4 +1,4 @@
-// Donjons du Crepuscule - v1.1
+// Donjons du Crepuscule - v1.2
 //
 //  * 3 teleporteurs (vert = Foret, rouge = Volcan, bleu = Lac) qui envoient dans les 3 premiers temples
 //    par le changement de stage natif du jeu (comme le Boss Rush de Twilit Essentials).
@@ -68,31 +68,23 @@ struct MobDef {
     const char* label;
     int proc;       // fpcNm_E_xxx_e
     uint32_t params;
-    int sizePct;    // 0 = utiliser le reglage "Taille" du menu
+    int hp;         // 0 = vie normale ; sinon vie imposee (champ health, commun a tous les acteurs)
 };
 
-// Identifiants d'acteurs ennemis du jeu. Les noms sont a identifier en jeu avec le menu de debogage.
+// SEULS les ennemis dont j'ai lu le code de creation (parametres et conditions d'echec) sont ici.
+// Les autres plantent avec des parametres generiques (ex. E_DN = Dinolfos : plantage constate).
+//   E_BA  Keese        : 0xFFFFFFFF = pas d'interrupteur, pas de chemin, accroche au plafond
+//   E_YK  Shadow Keese : 0xFFFFFFFF = idem (ennemi du Crepuscule)
+//   E_FZ  Mini Freezard: le jeu le cree lui-meme avec le parametre 1
 const MobDef kMobs[] = {
-    {"E_BA", fpcNm_E_BA_e, 0xFFFFFFFFu}, {"E_KG", fpcNm_E_KG_e, 0xFFFFFFFFu},
-    {"E_GB", fpcNm_E_GB_e, 0xFFFFFFFFu}, {"E_WS", fpcNm_E_WS_e, 0xFFFFFFFFu},
-    {"E_DN", fpcNm_E_DN_e, 0xFFFFFFFFu}, {"E_S1", fpcNm_E_S1_e, 0xFFFFFFFFu},
-    {"E_SF", fpcNm_E_SF_e, 0xFFFFFFFFu}, {"E_OC", fpcNm_E_OC_e, 0xFFFFFFFFu},
-    {"E_HB", fpcNm_E_HB_e, 0xFFFFFFFFu}, {"E_MK", fpcNm_E_MK_e, 0xFFFFFFFFu},
-    {"E_PO", fpcNm_E_PO_e, 0xFFFFFFFFu}, {"E_TT", fpcNm_E_TT_e, 0xFFFFFFFFu},
-    {"E_YM", fpcNm_E_YM_e, 0xFFFFFFFFu}, {"E_GM", fpcNm_E_GM_e, 0xFFFFFFFFu},
-    {"E_BI", fpcNm_E_BI_e, 0xFFFFFFFFu}, {"E_RB", fpcNm_E_RB_e, 0xFFFFFFFFu},
-    {"E_ST", fpcNm_E_ST_e, 0xFFFFFFFFu}, {"E_TK", fpcNm_E_TK_e, 0xFFFFFFFFu},
-    {"E_SB", fpcNm_E_SB_e, 0xFFFFFFFFu}, {"E_ZH", fpcNm_E_ZH_e, 0xFFFFFFFFu},
-    {"E_ZM (masque ?)", fpcNm_E_ZM_e, 0xFFFFFFFFu},
-    {"E_DB (boss Diababa : experimental)", fpcNm_E_DB_e, 0xFFFFFFFFu},
-    // ---- Monstres personnalises : modeles du jeu, taille modifiee (vie/degats/couleur : etape suivante)
-    {"Perso : Géant E_GB (x2.2)", fpcNm_E_GB_e, 0xFFFFFFFFu, 220},
-    {"Perso : Minuscule E_BA (x0.4)", fpcNm_E_BA_e, 0xFFFFFFFFu, 40},
-    {"Perso : Colosse E_DN (x2.5)", fpcNm_E_DN_e, 0xFFFFFFFFu, 250},
-    {"Perso : Titan E_WS (x3)", fpcNm_E_WS_e, 0xFFFFFFFFu, 300},
-    {"Perso : Brute E_S1 (x1.8)", fpcNm_E_S1_e, 0xFFFFFFFFu, 180},
-    {"Perso : Grand E_HB (x1.6)", fpcNm_E_HB_e, 0xFFFFFFFFu, 160},
-    {"Perso : Mini boss E_DB (x0.35)", fpcNm_E_DB_e, 0xFFFFFFFFu, 35},
+    {"Keese (E_BA)", fpcNm_E_BA_e, 0xFFFFFFFFu, 0},
+    {"Shadow Keese - Crépuscule (E_YK)", fpcNm_E_YK_e, 0xFFFFFFFFu, 0},
+    {"Mini Freezard (E_FZ)", fpcNm_E_FZ_e, 1u, 0},
+    // ---- Monstres personnalises : memes modeles, vie modifiee ----
+    {"Perso : Keese robuste (vie 6)", fpcNm_E_BA_e, 0xFFFFFFFFu, 6},
+    {"Perso : Shadow Keese alpha (vie 10)", fpcNm_E_YK_e, 0xFFFFFFFFu, 10},
+    {"Perso : Shadow Keese élite (vie 20)", fpcNm_E_YK_e, 0xFFFFFFFFu, 20},
+    {"Perso : Mini Freezard colosse (vie 240)", fpcNm_E_FZ_e, 1u, 240},
 };
 constexpr int kMobCount = static_cast<int>(sizeof(kMobs) / sizeof(kMobs[0]));
 
@@ -129,6 +121,15 @@ const char* const kStageChoices[] = {"D_MN01", "D_MN04", "D_MN05", "D_MN06", "D_
 constexpr int kStageChoiceCount = static_cast<int>(sizeof(kStageChoices) / sizeof(kStageChoices[0]));
 const int kDefStageIdx[3] = {2, 1, 0};  // D_MN05, D_MN04, D_MN01
 ConfigVarHandle v_dStage[3]{};
+
+struct HpJob {
+    fpc_ProcID id;
+    int hp;
+    bool found;
+    int framesFound;
+    int framesWaiting;
+};
+std::vector<HpJob> g_hpJobs;
 
 Portal g_portal[3];
 Origin g_origin;
@@ -280,8 +281,7 @@ bool appendLocation(const char* tag, const char* stage, int room, const cXyz& po
 }
 
 // Fait apparaitre un monstre devant Link (ou autour pour le mode difficile).
-void spawnMob(fopAc_ac_c* player, int mobIdx, float distance, float angleOffsetRad, int room,
-    float sizePct) {
+void spawnMob(fopAc_ac_c* player, int mobIdx, float distance, float angleOffsetRad, int room) {
     if (mobIdx < 0 || mobIdx >= kMobCount) {
         return;
     }
@@ -290,10 +290,49 @@ void spawnMob(fopAc_ac_c* player, int mobIdx, float distance, float angleOffsetR
     cXyz pos(player->current.pos.x + std::sin(a) * distance, player->current.pos.y + 20.0f,
         player->current.pos.z + std::cos(a) * distance);
     csXyz ang(0, static_cast<s16>(player->shape_angle.y + 0x8000), 0);
-    const float s = (m.sizePct > 0 ? static_cast<float>(m.sizePct) : sizePct) / 100.0f;
-    cXyz scale(s, s, s);
-    mods::log::info("SPAWN {} (proc {}) x{:.2f} salle {}", m.label, m.proc, s, room);
-    fopAcM_create(static_cast<s16>(m.proc), m.params, &pos, room, &ang, &scale, -1);
+    mods::log::info("SPAWN {} (proc {}, params {:#x}, vie {}) salle {}", m.label, m.proc, m.params, m.hp,
+        room);
+    const fpc_ProcID id = fopAcM_create(static_cast<s16>(m.proc), m.params, &pos, room, &ang, nullptr, -1);
+    if (id == fpcM_ERROR_PROCESS_ID_e) {
+        mods::log::error("SPAWN refuse par le jeu : {}", m.label);
+        return;
+    }
+    if (m.hp > 0) {
+        g_hpJobs.push_back({id, m.hp, false, 0, 0});
+    }
+}
+
+// Applique la vie voulue : l'acteur fixe sa propre vie dans sa creation, donc on la redefinit
+// pendant ~1,5 s apres son apparition (avant qu'il puisse etre touche).
+struct HpScan {
+    HpJob* job;
+};
+int hpCb(void* actor, void* data) {
+    HpScan* sc = static_cast<HpScan*>(data);
+    fopAc_ac_c* a = static_cast<fopAc_ac_c*>(actor);
+    if (a != nullptr && fopAcM_GetID(a) == sc->job->id) {
+        sc->job->found = true;
+        a->health = static_cast<s16>(sc->job->hp);
+        a->field_0x560 = static_cast<s16>(sc->job->hp);
+    }
+    return 1;
+}
+void updateHpJobs() {
+    for (size_t i = 0; i < g_hpJobs.size();) {
+        HpJob& j = g_hpJobs[i];
+        HpScan sc{&j};
+        fopAcIt_Executor(hpCb, &sc);
+        if (j.found) {
+            ++j.framesFound;
+        } else {
+            ++j.framesWaiting;
+        }
+        if (j.framesFound > 90 || j.framesWaiting > 900) {
+            g_hpJobs.erase(g_hpJobs.begin() + static_cast<long>(i));
+        } else {
+            ++i;
+        }
+    }
 }
 
 // =============================================================================================
@@ -466,7 +505,7 @@ void updateRaid(fopAc_ac_c* player, const char* stage, int room) {
                 const int idx = std::clamp(cfgInt(v_hardMob), 0, kMobCount - 1);
                 for (int k = 0; k < n; ++k) {
                     const float ang = (6.2831853f / std::max(n, 1)) * static_cast<float>(k);
-                    spawnMob(player, idx, 450.0f, ang, room, static_cast<float>(cfgInt(v_size)));
+                    spawnMob(player, idx, 450.0f, ang, room);
                 }
                 g_hardSpawnedThisRaid += n;
                 char msg[96];
@@ -526,7 +565,9 @@ void setStageSel(ModContext*, void* ud, const UiControlValue* v) {
 void getSpawnMob(ModContext*, void*, UiControlValue* out) { out->int_value = g_spawnMob; }
 void setSpawnMob(ModContext*, void*, const UiControlValue* v) { g_spawnMob = static_cast<int>(v->int_value); }
 
-void getHardMob(ModContext*, void*, UiControlValue* out) { out->int_value = cfgInt(v_hardMob); }
+void getHardMob(ModContext*, void*, UiControlValue* out) {
+    out->int_value = std::clamp(cfgInt(v_hardMob), 0, kMobCount - 1);
+}
 void setHardMob(ModContext*, void*, const UiControlValue* v) {
     svc_config->set_int(mod_ctx, v_hardMob, v->int_value);
 }
@@ -638,15 +679,15 @@ ModResult buildDifficulty(ModContext*, UiWindowHandle, UiElementHandle left, UiE
     addToggle(left, "Activer le mode difficile", v_hard,
         "Des monstres supplémentaires surgissent à chaque nouvelle salle du donjon.");
     addNumber(left, "Monstres en plus par salle", v_extra, 1, 6, 1, "", nullptr);
-    addNumber(left, "Taille des monstres", v_size, 30, 250, 10, " %", "100 % = taille normale.");
     addMobDropdown(left, "Monstre du mode difficile", getHardMob, setHardMob,
         "Identifiant du monstre à faire apparaître (à choisir avec l'onglet Débogage).");
     addSection(left, "Ambiance");
     addToggle(left, "Teinte sombre Crépuscule", v_tint, "Assombrit l'ambiance dans le donjon.");
     addNumber(left, "Luminosité", v_tintPct, 20, 100, 5, " %", "Plus bas = plus sombre.");
     addText(right,
-        "Mode difficile : plus de monstres (pas encore de boss modifiés). La teinte est une "
-        "approximation : le vrai filtre doré nécessite un shader (prochaine étape).");
+        "Mode difficile : plus de monstres par salle (vie personnalisable via les monstres Perso). "
+        "Pas encore de boss modifiés. La teinte est une approximation : le vrai filtre doré "
+        "nécessite un shader.");
     return MOD_OK;
 }
 
@@ -673,8 +714,7 @@ ModResult buildDebug(ModContext*, UiWindowHandle, UiElementHandle left, UiElemen
     }
     addSection(left, "Monstres");
     addMobDropdown(left, "Monstre à faire apparaître", getSpawnMob, setSpawnMob,
-        "Expérimental : certains peuvent faire planter. Note ceux qui marchent.");
-    addNumber(left, "Taille", v_size, 30, 250, 10, " %", nullptr);
+        "Seuls les monstres dont le code a été vérifié sont proposés.");
     addButton(left, "Faire apparaître devant Link", cbSpawn, 0, nullptr);
     addSection(left, "Sécurité");
     addButton(left, "Annuler le retour automatique", cbCancel, 0,
@@ -750,7 +790,7 @@ void processRequests(fopAc_ac_c* player, const char* stage, int room) {
     }
     if (g_reqSpawn) {
         g_reqSpawn = false;
-        spawnMob(player, g_spawnMob, 300.0f, 0.0f, room, static_cast<float>(cfgInt(v_size)));
+        spawnMob(player, g_spawnMob, 300.0f, 0.0f, room);
         toast("Monstre", kMobs[std::clamp(g_spawnMob, 0, kMobCount - 1)].label, 2000);
     }
     if (g_reqWarp >= 0 && g_phase == PH_NONE) {
@@ -851,7 +891,7 @@ MOD_EXPORT ModResult mod_initialize(ModError*) {
         mods::log::error("Impossible d'ajouter l'onglet au menu");
     }
 
-    mods::log::info("Donjons du Crepuscule v1.1 charge (dossier de donnees : {})",
+    mods::log::info("Donjons du Crepuscule v1.2 charge (dossier de donnees : {})",
         g_dataDir ? g_dataDir : "(inconnu)");
     return MOD_OK;
 }
@@ -870,6 +910,7 @@ MOD_EXPORT ModResult mod_update(ModError*) {
     const int room = dComIfGp_roomControl_getStayNo();
     const u32 trig = mDoCPd_c::getTrig(0);
 
+    updateHpJobs();
     processRequests(player, stage, room);
 
     if (g_phase != PH_NONE) {

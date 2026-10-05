@@ -1,4 +1,4 @@
-// Donjons du Crepuscule - v1.0
+// Donjons du Crepuscule - v1.1
 //
 //  * 3 teleporteurs (vert = Foret, rouge = Volcan, bleu = Lac) qui envoient dans les 3 premiers temples
 //    par le changement de stage natif du jeu (comme le Boss Rush de Twilit Essentials).
@@ -20,6 +20,7 @@
 #include <ctime>
 #include <fstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "mods/service.hpp"
@@ -34,6 +35,8 @@
 #include "f_op/f_op_actor_mng.h"
 #include "f_pc/f_pc_name.h"
 #include "m_Do/m_Do_controller_pad.h"
+
+#include "proc_names.hpp"
 
 DEFINE_MOD();
 IMPORT_SERVICE(LogService, svc_log);
@@ -65,6 +68,7 @@ struct MobDef {
     const char* label;
     int proc;       // fpcNm_E_xxx_e
     uint32_t params;
+    int sizePct;    // 0 = utiliser le reglage "Taille" du menu
 };
 
 // Identifiants d'acteurs ennemis du jeu. Les noms sont a identifier en jeu avec le menu de debogage.
@@ -81,6 +85,14 @@ const MobDef kMobs[] = {
     {"E_SB", fpcNm_E_SB_e, 0xFFFFFFFFu}, {"E_ZH", fpcNm_E_ZH_e, 0xFFFFFFFFu},
     {"E_ZM (masque ?)", fpcNm_E_ZM_e, 0xFFFFFFFFu},
     {"E_DB (boss Diababa : experimental)", fpcNm_E_DB_e, 0xFFFFFFFFu},
+    // ---- Monstres personnalises : modeles du jeu, taille modifiee (vie/degats/couleur : etape suivante)
+    {"Perso : Géant E_GB (x2.2)", fpcNm_E_GB_e, 0xFFFFFFFFu, 220},
+    {"Perso : Minuscule E_BA (x0.4)", fpcNm_E_BA_e, 0xFFFFFFFFu, 40},
+    {"Perso : Colosse E_DN (x2.5)", fpcNm_E_DN_e, 0xFFFFFFFFu, 250},
+    {"Perso : Titan E_WS (x3)", fpcNm_E_WS_e, 0xFFFFFFFFu, 300},
+    {"Perso : Brute E_S1 (x1.8)", fpcNm_E_S1_e, 0xFFFFFFFFu, 180},
+    {"Perso : Grand E_HB (x1.6)", fpcNm_E_HB_e, 0xFFFFFFFFu, 160},
+    {"Perso : Mini boss E_DB (x0.35)", fpcNm_E_DB_e, 0xFFFFFFFFu, 35},
 };
 constexpr int kMobCount = static_cast<int>(sizeof(kMobs) / sizeof(kMobs[0]));
 
@@ -111,6 +123,13 @@ ConfigVarHandle v_unlock[3]{};
 ConfigVarHandle v_pSet[3]{}, v_pStage[3]{}, v_pRoom[3]{}, v_pX[3]{}, v_pY[3]{}, v_pZ[3]{};
 ConfigVarHandle v_dPoint[3]{}, v_dRoom[3]{};
 
+// Stages de donjons proposes dans le menu (pour corriger une destination sans recompiler)
+const char* const kStageChoices[] = {"D_MN01", "D_MN04", "D_MN05", "D_MN06", "D_MN07", "D_MN08", "D_MN09",
+    "D_MN10", "D_MN11"};
+constexpr int kStageChoiceCount = static_cast<int>(sizeof(kStageChoices) / sizeof(kStageChoices[0]));
+const int kDefStageIdx[3] = {2, 1, 0};  // D_MN05, D_MN04, D_MN01
+ConfigVarHandle v_dStage[3]{};
+
 Portal g_portal[3];
 Origin g_origin;
 Phase g_phase = PH_NONE;
@@ -125,6 +144,7 @@ bool g_reqShowPos = false;
 bool g_reqSavePos = false;
 bool g_reqSpawn = false;
 bool g_reqCancel = false;
+bool g_reqScan = false;
 
 int g_spawnMob = 0;      // monstre choisi dans le menu
 int g_hardMobIdx = 0;    // monstre utilise par le mode difficile (copie de la config)
@@ -209,8 +229,13 @@ float dist2D(const cXyz& p, float x, float z) {
     return std::sqrt(dx * dx + dz * dz);
 }
 
+std::string dungeonStage(int d) {
+    const int i = std::clamp(cfgInt(v_dStage[d]), 0, kStageChoiceCount - 1);
+    return kStageChoices[i];
+}
+
 bool insideDungeon(const char* stage, int d) {
-    return std::strncmp(stage, kDungeons[d].prefix, 6) == 0;
+    return std::strncmp(stage, dungeonStage(d).c_str(), 6) == 0;
 }
 
 bool isUnlocked(int d) {
@@ -265,10 +290,80 @@ void spawnMob(fopAc_ac_c* player, int mobIdx, float distance, float angleOffsetR
     cXyz pos(player->current.pos.x + std::sin(a) * distance, player->current.pos.y + 20.0f,
         player->current.pos.z + std::cos(a) * distance);
     csXyz ang(0, static_cast<s16>(player->shape_angle.y + 0x8000), 0);
-    const float s = sizePct / 100.0f;
+    const float s = (m.sizePct > 0 ? static_cast<float>(m.sizePct) : sizePct) / 100.0f;
     cXyz scale(s, s, s);
     mods::log::info("SPAWN {} (proc {}) x{:.2f} salle {}", m.label, m.proc, s, room);
     fopAcM_create(static_cast<s16>(m.proc), m.params, &pos, room, &ang, &scale, -1);
+}
+
+// =============================================================================================
+//  Scanner de salle : liste tous les acteurs presents (nom, groupe, position) dans locations.txt
+// =============================================================================================
+
+struct ScanCtx {
+    std::ofstream* file;
+    int count;
+    std::vector<std::pair<std::string, int>> tally;
+};
+
+const char* procLabel(int id) {
+    for (int i = 0; i < kOrProcNameCount; ++i) {
+        if (kOrProcNames[i].id == id) {
+            return kOrProcNames[i].name;
+        }
+    }
+    return "?";
+}
+
+int scanCb(void* actor, void* data) {
+    ScanCtx* c = static_cast<ScanCtx*>(data);
+    if (actor == nullptr || c->count >= 800) {
+        return 1;
+    }
+    fopAc_ac_c* a = static_cast<fopAc_ac_c*>(actor);
+    const int id = fopAcM_GetName(a);
+    const char* name = procLabel(id);
+    char line[200];
+    std::snprintf(line, sizeof(line), "  ACTOR %s (id %d) groupe=%d x=%.0f y=%.0f z=%.0f", name, id,
+        static_cast<int>(fopAcM_GetGroup(a)), a->current.pos.x, a->current.pos.y, a->current.pos.z);
+    if (c->file != nullptr) {
+        *c->file << line << "\n";
+    }
+    ++c->count;
+    for (auto& t : c->tally) {
+        if (t.first == name) {
+            ++t.second;
+            return 1;
+        }
+    }
+    c->tally.push_back({name, 1});
+    return 1;
+}
+
+void scanRoom(const char* stage, int room) {
+    ScanCtx ctx{nullptr, 0, {}};
+    std::ofstream f;
+    if (g_dataDir != nullptr) {
+        f.open(std::string(g_dataDir) + "/locations.txt", std::ios::app);
+        if (f) {
+            ctx.file = &f;
+            f << "SCAN stage=" << stage << " room=" << room << "\n";
+        }
+    }
+    fopAcIt_Executor(scanCb, &ctx);
+    std::sort(ctx.tally.begin(), ctx.tally.end(),
+        [](const auto& x, const auto& y) { return x.second > y.second; });
+    std::string summary;
+    for (const auto& t : ctx.tally) {
+        summary += t.first + " x" + std::to_string(t.second) + "  ";
+    }
+    if (f) {
+        f << "  RESUME " << summary << "\n";
+    }
+    mods::log::info("SCAN stage={} salle={} total={} : {}", stage, room, ctx.count, summary);
+    char buf[160];
+    std::snprintf(buf, sizeof(buf), "%d acteurs. Voir locations.txt et le journal.", ctx.count);
+    toast("Scan de la salle", buf, 4000);
 }
 
 // =============================================================================================
@@ -291,15 +386,16 @@ void startWarp(fopAc_ac_c* player, const char* stage, int room, int d) {
 
     const int point = cfgInt(v_dPoint[d]);
     const int droom = cfgInt(v_dRoom[d]);
+    const std::string dstage = dungeonStage(d);
     mods::log::info("WARP vers {} (point {}, salle {}) depuis {} salle {} ({:.0f},{:.0f},{:.0f})",
-        kDungeons[d].prefix, point, droom, stage, room, g_origin.x, g_origin.y, g_origin.z);
+        dstage, point, droom, stage, room, g_origin.x, g_origin.y, g_origin.z);
 
     g_dun = d;
     g_phase = PH_GOING;
     g_phaseFrames = 0;
     g_hardSpawnedThisRaid = 0;
     g_lastRoom = -1;
-    dComIfGp_setNextStage(kDungeons[d].prefix, static_cast<s16>(point), static_cast<s8>(droom), -1);
+    dComIfGp_setNextStage(dstage.c_str(), static_cast<s16>(point), static_cast<s8>(droom), -1);
     g_cooldown = 60;
 }
 
@@ -418,6 +514,14 @@ void cbShowPos(ModContext*, void*) { g_reqShowPos = true; }
 void cbSavePos(ModContext*, void*) { g_reqSavePos = true; }
 void cbSpawn(ModContext*, void*) { g_reqSpawn = true; }
 void cbCancel(ModContext*, void*) { g_reqCancel = true; }
+void cbScan(ModContext*, void*) { g_reqScan = true; }
+
+void getStageSel(ModContext*, void* ud, UiControlValue* out) {
+    out->int_value = std::clamp(cfgInt(v_dStage[reinterpret_cast<intptr_t>(ud)]), 0, kStageChoiceCount - 1);
+}
+void setStageSel(ModContext*, void* ud, const UiControlValue* v) {
+    svc_config->set_int(mod_ctx, v_dStage[reinterpret_cast<intptr_t>(ud)], v->int_value);
+}
 
 void getSpawnMob(ModContext*, void*, UiControlValue* out) { out->int_value = g_spawnMob; }
 void setSpawnMob(ModContext*, void*, const UiControlValue* v) { g_spawnMob = static_cast<int>(v->int_value); }
@@ -502,6 +606,21 @@ ModResult buildTeleport(ModContext*, UiWindowHandle, UiElementHandle left, UiEle
         addButton(left, kBtn[i], cbWarp, i,
             "Te téléporte dans le donjon. En sortant, tu reviens là où tu étais.");
     }
+    addSection(left, "Destination de chaque portail");
+    static const char* kDestLbl[3] = {"Portail vert : stage", "Portail rouge : stage", "Portail bleu : stage"};
+    for (int i = 0; i < 3; ++i) {
+        UiControlDesc c = UI_CONTROL_DESC_INIT;
+        c.kind = UI_CONTROL_DROPDOWN;
+        c.label = kDestLbl[i];
+        c.help_rml = "Si le portail t'envoie au mauvais endroit, essaie un autre stage de donjon.";
+        c.binding = UI_BINDING_CALLBACKS;
+        c.get = getStageSel;
+        c.set = setStageSel;
+        c.user_data = reinterpret_cast<void*>(static_cast<intptr_t>(i));
+        c.options = kStageChoices;
+        c.option_count = static_cast<size_t>(kStageChoiceCount);
+        svc_ui->pane_add_control(mod_ctx, left, &c, nullptr);
+    }
     addSection(left, "Déblocage");
     addToggle(left, "Tout débloquer", v_unlockAll, "Active les 3 portails.");
     addToggle(left, "Débloquer : Forêt (vert)", v_unlock[0], nullptr);
@@ -537,6 +656,8 @@ ModResult buildDebug(ModContext*, UiWindowHandle, UiElementHandle left, UiElemen
     addButton(left, "Afficher stage / salle / position", cbShowPos, 0, nullptr);
     addButton(left, "Enregistrer la position (fichier)", cbSavePos, 0,
         "Ajoute une ligne dans locations.txt (dossier de données du mod).");
+    addButton(left, "Scanner la salle (liste des acteurs)", cbScan, 0,
+        "Écrit tous les acteurs de la salle dans locations.txt et le journal.");
     addSection(left, "Emplacement des portails");
     static const char* kSet[3] = {"Placer le portail vert ici", "Placer le portail rouge ici",
         "Placer le portail bleu ici"};
@@ -598,6 +719,10 @@ void processRequests(fopAc_ac_c* player, const char* stage, int room) {
         toast("Position actuelle", buf, 5000);
         mods::log::info("DIAG stage={} salle={} pos=({:.1f},{:.1f},{:.1f})", stage, room,
             player->current.pos.x, player->current.pos.y, player->current.pos.z);
+    }
+    if (g_reqScan) {
+        g_reqScan = false;
+        scanRoom(stage, room);
     }
     if (g_reqSavePos) {
         g_reqSavePos = false;
@@ -698,10 +823,12 @@ MOD_EXPORT ModResult mod_initialize(ModError*) {
         ok &= regFloat(names[i][6], 0.0, &v_pZ[i]);
 
     }
-    static char dnames[3][2][24];
+    static char dnames[3][3][24];
     for (int i = 0; i < 3; ++i) {
         std::snprintf(dnames[i][0], 24, "d%d_point", i);
         std::snprintf(dnames[i][1], 24, "d%d_room", i);
+        std::snprintf(dnames[i][2], 24, "d%d_stage", i);
+        ok &= regInt(dnames[i][2], kDefStageIdx[i], &v_dStage[i]);
         ok &= regInt(dnames[i][0], kDungeons[i].defPoint, &v_dPoint[i]);
         ok &= regInt(dnames[i][1], kDungeons[i].defRoom, &v_dRoom[i]);
     }
@@ -724,7 +851,7 @@ MOD_EXPORT ModResult mod_initialize(ModError*) {
         mods::log::error("Impossible d'ajouter l'onglet au menu");
     }
 
-    mods::log::info("Donjons du Crepuscule v1.0 charge (dossier de donnees : {})",
+    mods::log::info("Donjons du Crepuscule v1.1 charge (dossier de donnees : {})",
         g_dataDir ? g_dataDir : "(inconnu)");
     return MOD_OK;
 }

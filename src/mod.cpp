@@ -1,4 +1,4 @@
-// Donjons du Crepuscule - v1.2
+// Donjons du Crepuscule - v2.0 (placement de monstres via StageService : plus de plantage au spawn)
 //
 //  * 3 teleporteurs (vert = Foret, rouge = Volcan, bleu = Lac) qui envoient dans les 3 premiers temples
 //    par le changement de stage natif du jeu (comme le Boss Rush de Twilit Essentials).
@@ -27,6 +27,7 @@
 #include "mods/svc/config.h"
 #include "mods/svc/host.h"
 #include "mods/svc/log.hpp"
+#include "mods/svc/stage.h"
 #include "mods/svc/ui.h"
 
 #include "d/d_com_inf_game.h"
@@ -42,6 +43,7 @@ DEFINE_MOD();
 IMPORT_SERVICE(LogService, svc_log);
 IMPORT_SERVICE(ConfigService, svc_config);
 IMPORT_SERVICE(HostService, svc_host);
+IMPORT_SERVICE(StageService, svc_stage);
 IMPORT_SERVICE(UiService, svc_ui);
 
 namespace {
@@ -66,25 +68,25 @@ const Dungeon kDungeons[3] = {
 
 struct MobDef {
     const char* label;
-    int proc;       // fpcNm_E_xxx_e
+    const char* obj;   // nom de l'objet dans les donnees de stage (d_stage.cpp, l_objectName)
+    int proc;          // fpcNm_E_xxx_e (sert a retrouver l'acteur pour imposer sa vie)
     uint32_t params;
-    int hp;         // 0 = vie normale ; sinon vie imposee (champ health, commun a tous les acteurs)
+    int hp;            // 0 = vie normale ; sinon vie imposee (champ health, commun a tous les acteurs)
 };
 
-// SEULS les ennemis dont j'ai lu le code de creation (parametres et conditions d'echec) sont ici.
-// Les autres plantent avec des parametres generiques (ex. E_DN = Dinolfos : plantage constate).
-//   E_BA  Keese        : 0xFFFFFFFF = pas d'interrupteur, pas de chemin, accroche au plafond
-//   E_YK  Shadow Keese : 0xFFFFFFFF = idem (ennemi du Crepuscule)
-//   E_FZ  Mini Freezard: le jeu le cree lui-meme avec le parametre 1
+// SEULS les ennemis dont j'ai lu le code de creation sont ici.
+//   Keese        : params 0xFFFFFFFF = pas d'interrupteur, pas de chemin, accroche au plafond
+//   Shadow Keese : params 0xFFFFFFFF = idem (ennemi du Crepuscule)
+//   Mini Freezard: params 1 (valeur utilisee par le jeu lui-meme)
 const MobDef kMobs[] = {
-    {"Keese (E_BA)", fpcNm_E_BA_e, 0xFFFFFFFFu, 0},
-    {"Shadow Keese - Crépuscule (E_YK)", fpcNm_E_YK_e, 0xFFFFFFFFu, 0},
-    {"Mini Freezard (E_FZ)", fpcNm_E_FZ_e, 1u, 0},
+    {"Keese", "E_ba", fpcNm_E_BA_e, 0xFFFFFFFFu, 0},
+    {"Shadow Keese - Crépuscule", "E_yk", fpcNm_E_YK_e, 0xFFFFFFFFu, 0},
+    {"Mini Freezard", "E_fz", fpcNm_E_FZ_e, 1u, 0},
     // ---- Monstres personnalises : memes modeles, vie modifiee ----
-    {"Perso : Keese robuste (vie 6)", fpcNm_E_BA_e, 0xFFFFFFFFu, 6},
-    {"Perso : Shadow Keese alpha (vie 10)", fpcNm_E_YK_e, 0xFFFFFFFFu, 10},
-    {"Perso : Shadow Keese élite (vie 20)", fpcNm_E_YK_e, 0xFFFFFFFFu, 20},
-    {"Perso : Mini Freezard colosse (vie 240)", fpcNm_E_FZ_e, 1u, 240},
+    {"Perso : Keese robuste (vie 6)", "E_ba", fpcNm_E_BA_e, 0xFFFFFFFFu, 6},
+    {"Perso : Shadow Keese alpha (vie 10)", "E_yk", fpcNm_E_YK_e, 0xFFFFFFFFu, 10},
+    {"Perso : Shadow Keese élite (vie 20)", "E_yk", fpcNm_E_YK_e, 0xFFFFFFFFu, 20},
+    {"Perso : Mini Freezard colosse (vie 240)", "E_fz", fpcNm_E_FZ_e, 1u, 240},
 };
 constexpr int kMobCount = static_cast<int>(sizeof(kMobs) / sizeof(kMobs[0]));
 
@@ -103,7 +105,7 @@ struct Origin {
     s16 yaw = 0;
 };
 
-enum Phase { PH_NONE, PH_GOING, PH_INSIDE, PH_RETURNING, PH_ARRIVED };
+enum Phase { PH_NONE, PH_GOING, PH_INSIDE, PH_RETURNING, PH_ARRIVED, PH_RELOAD };
 
 // =============================================================================================
 //  Etat
@@ -143,7 +145,10 @@ int g_reqWarp = -1;
 int g_reqSetPortal = -1;
 bool g_reqShowPos = false;
 bool g_reqSavePos = false;
-bool g_reqSpawn = false;
+bool g_reqPlace = false;
+bool g_reqUndo = false;
+bool g_reqReload = false;
+bool g_sawLoading = false;
 bool g_reqCancel = false;
 bool g_reqScan = false;
 
@@ -280,26 +285,167 @@ bool appendLocation(const char* tag, const char* stage, int room, const cXyz& po
     return true;
 }
 
-// Fait apparaitre un monstre devant Link (ou autour pour le mode difficile).
-void spawnMob(fopAc_ac_c* player, int mobIdx, float distance, float angleOffsetRad, int room) {
-    if (mobIdx < 0 || mobIdx >= kMobCount) {
+// =============================================================================================
+//  Placements de monstres : ajoutes a la liste d'acteurs de la salle (StageService), comme si
+//  le jeu les lisait dans ses propres fichiers. Sauvegardes dans placements.txt.
+// =============================================================================================
+
+struct Placement {
+    std::string stage;
+    int room = 0, layer = -1;
+    std::string obj;
+    uint32_t params = 0;
+    float x = 0, y = 0, z = 0;
+    int yaw = 0, hp = 0;
+    StageActorHandle handle = 0;
+    bool active = false;
+};
+std::vector<Placement> g_place;
+std::vector<fpc_ProcID> g_hpKnown;
+std::string g_lastHpStage;
+int g_discTimer = 0;
+
+int procOfObj(const std::string& obj) {
+    for (int i = 0; i < kMobCount; ++i) {
+        if (obj == kMobs[i].obj) {
+            return kMobs[i].proc;
+        }
+    }
+    return -1;
+}
+
+bool registerEdit(Placement& p) {
+    stage_actor_data_class rec = {"E_ba", p.params, cXyz(p.x, p.y, p.z), csXyz(0, static_cast<s16>(p.yaw), 0), 0};
+    std::memset(rec.name, 0, sizeof(rec.name));
+    std::strncpy(rec.name, p.obj.c_str(), 7);
+    const ModResult r = svc_stage->add_actor(mod_ctx, p.stage.c_str(), static_cast<uint8_t>(p.room),
+        static_cast<int8_t>(p.layer), &rec, sizeof(rec), &p.handle);
+    p.active = (r == MOD_OK);
+    if (!p.active) {
+        mods::log::error("add_actor refuse : {} salle {} {}", p.stage, p.room, p.obj);
+    }
+    return p.active;
+}
+
+void savePlacements() {
+    if (g_dataDir == nullptr) {
         return;
     }
-    const MobDef& m = kMobs[mobIdx];
-    const float a = static_cast<float>(player->shape_angle.y) * (3.14159265f / 32768.0f) + angleOffsetRad;
-    cXyz pos(player->current.pos.x + std::sin(a) * distance, player->current.pos.y + 20.0f,
-        player->current.pos.z + std::cos(a) * distance);
-    csXyz ang(0, static_cast<s16>(player->shape_angle.y + 0x8000), 0);
-    mods::log::info("SPAWN {} (proc {}, params {:#x}, vie {}) salle {}", m.label, m.proc, m.params, m.hp,
-        room);
-    const fpc_ProcID id = fopAcM_create(static_cast<s16>(m.proc), m.params, &pos, room, &ang, nullptr, -1);
-    if (id == fpcM_ERROR_PROCESS_ID_e) {
-        mods::log::error("SPAWN refuse par le jeu : {}", m.label);
+    std::ofstream f(std::string(g_dataDir) + "/placements.txt", std::ios::trunc);
+    for (const Placement& p : g_place) {
+        char line[256];
+        std::snprintf(line, sizeof(line), "%s|%d|%d|%s|%u|%.1f|%.1f|%.1f|%d|%d", p.stage.c_str(), p.room,
+            p.layer, p.obj.c_str(), static_cast<unsigned>(p.params), p.x, p.y, p.z, p.yaw, p.hp);
+        f << line << "\n";
+    }
+}
+
+void loadPlacements() {
+    if (g_dataDir == nullptr) {
         return;
     }
-    if (m.hp > 0) {
-        g_hpJobs.push_back({id, m.hp, false, 0, 0});
+    std::ifstream f(std::string(g_dataDir) + "/placements.txt");
+    std::string line;
+    while (std::getline(f, line)) {
+        char st[16] = {0}, ob[16] = {0};
+        Placement p;
+        unsigned prm = 0;
+        if (std::sscanf(line.c_str(), "%15[^|]|%d|%d|%15[^|]|%u|%f|%f|%f|%d|%d", st, &p.room, &p.layer, ob, &prm,
+                &p.x, &p.y, &p.z, &p.yaw, &p.hp) == 10) {
+            p.stage = st;
+            p.obj = ob;
+            p.params = prm;
+            registerEdit(p);
+            g_place.push_back(p);
+        }
     }
+    mods::log::info("{} monstre(s) place(s) charge(s) depuis placements.txt", g_place.size());
+}
+
+void placeHere(fopAc_ac_c* player, const char* stage, int room) {
+    const MobDef& m = kMobs[std::clamp(g_spawnMob, 0, kMobCount - 1)];
+    const float a = static_cast<float>(player->shape_angle.y) * (3.14159265f / 32768.0f);
+    Placement p;
+    p.stage = stage;
+    p.room = room;
+    p.layer = -1;
+    p.obj = m.obj;
+    p.params = m.params;
+    p.x = player->current.pos.x + std::sin(a) * 250.0f;
+    p.y = player->current.pos.y + 5.0f;
+    p.z = player->current.pos.z + std::cos(a) * 250.0f;
+    p.yaw = static_cast<s16>(player->shape_angle.y + 0x8000);
+    p.hp = m.hp;
+    const bool ok = registerEdit(p);
+    g_place.push_back(p);
+    savePlacements();
+    mods::log::info("PLACEMENT {} dans {} salle {} ({:.0f},{:.0f},{:.0f}) vie {} -> {}", m.label, stage, room, p.x,
+        p.y, p.z, m.hp, ok ? "ok" : "REFUSE");
+    toast(ok ? "Monstre placé" : "Échec du placement",
+        ok ? "Il apparaîtra au prochain chargement de la salle (bouton « Recharger la salle »)."
+           : "Le jeu a refusé le placement (voir le journal).");
+}
+
+void undoLast() {
+    if (g_place.empty()) {
+        toast("Rien à annuler", "Aucun monstre placé.");
+        return;
+    }
+    Placement& p = g_place.back();
+    if (p.active) {
+        svc_stage->remove_actor_edit(mod_ctx, p.handle);
+    }
+    g_place.pop_back();
+    savePlacements();
+    toast("Placement annulé", "Il disparaîtra au prochain chargement de la salle.");
+}
+
+bool anyHpPlacement(const std::string& stage) {
+    for (const Placement& p : g_place) {
+        if (p.active && p.hp > 0 && p.stage == stage) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Retrouve les monstres crees par le jeu a partir de nos placements et leur impose la vie voulue.
+int discCb(void* actor, void* data) {
+    fopAc_ac_c* a = static_cast<fopAc_ac_c*>(actor);
+    if (a == nullptr) {
+        return 1;
+    }
+    const int name = fopAcM_GetName(a);
+    const std::string& stage = *static_cast<const std::string*>(data);
+    for (const Placement& p : g_place) {
+        if (!p.active || p.hp <= 0 || p.stage != stage || procOfObj(p.obj) != name) {
+            continue;
+        }
+        const float dx = a->current.pos.x - p.x, dy = a->current.pos.y - p.y, dz = a->current.pos.z - p.z;
+        if (dx * dx + dy * dy + dz * dz < 400.0f * 400.0f) {
+            const fpc_ProcID id = fopAcM_GetID(a);
+            if (std::find(g_hpKnown.begin(), g_hpKnown.end(), id) == g_hpKnown.end()) {
+                g_hpKnown.push_back(id);
+                g_hpJobs.push_back({id, p.hp, false, 0, 0});
+                mods::log::info("VIE {} imposee a l'acteur {}", p.hp, static_cast<unsigned>(id));
+            }
+            break;
+        }
+    }
+    return 1;
+}
+
+void discoverHp(const std::string& stage) {
+    if (stage != g_lastHpStage) {
+        g_lastHpStage = stage;
+        g_hpKnown.clear();
+    }
+    if (++g_discTimer < 20 || !anyHpPlacement(stage)) {
+        return;
+    }
+    g_discTimer = 0;
+    std::string st = stage;
+    fopAcIt_Executor(discCb, &st);
 }
 
 // Applique la vie voulue : l'acteur fixe sa propre vie dans sa creation, donc on la redefinit
@@ -438,6 +584,23 @@ void startWarp(fopAc_ac_c* player, const char* stage, int room, int d) {
     g_cooldown = 60;
 }
 
+void startReload(fopAc_ac_c* player, const char* stage, int room) {
+    g_origin.valid = true;
+    g_origin.stage = stage;
+    g_origin.room = room;
+    g_origin.x = player->current.pos.x;
+    g_origin.y = player->current.pos.y;
+    g_origin.z = player->current.pos.z;
+    g_origin.yaw = player->shape_angle.y;
+    g_dun = -1;
+    g_phase = PH_RELOAD;
+    g_phaseFrames = 0;
+    g_sawLoading = false;
+    mods::log::info("RECHARGEMENT de {} salle {}", g_origin.stage, room);
+    dComIfGp_setNextStage(g_origin.stage.c_str(), 0, static_cast<s8>(room), -1);
+    g_cooldown = 60;
+}
+
 void endRaid() {
     g_phase = PH_NONE;
     g_dun = -1;
@@ -496,27 +659,16 @@ void updateRaid(fopAc_ac_c* player, const char* stage, int room) {
             g_tintActive = false;
         }
 
-        // ---- mode difficile : monstres en plus a chaque nouvelle salle ----
-        if (cfgBool(v_hard) && room != g_lastRoom && g_phaseFrames > 120) {
-            g_lastRoom = room;
-            int n = cfgInt(v_extra);
-            n = std::min(n, 6);
-            if (g_hardSpawnedThisRaid + n <= 40) {  // plafond : la memoire du jeu est limitee
-                const int idx = std::clamp(cfgInt(v_hardMob), 0, kMobCount - 1);
-                for (int k = 0; k < n; ++k) {
-                    const float ang = (6.2831853f / std::max(n, 1)) * static_cast<float>(k);
-                    spawnMob(player, idx, 450.0f, ang, room);
-                }
-                g_hardSpawnedThisRaid += n;
-                char msg[96];
-                std::snprintf(msg, sizeof(msg), "%d monstres supplémentaires surgissent !", n);
-                toast("Mode difficile", msg, 2500);
-            }
-        } else if (room != g_lastRoom && g_phaseFrames <= 120) {
-            g_lastRoom = room;
-        }
         break;
     }
+
+    case PH_RELOAD:
+        // On attend que la salle ait vraiment ete rechargee (joueur absent pendant le chargement).
+        if ((g_sawLoading && atOrigin) || g_phaseFrames > 600) {
+            g_phase = PH_ARRIVED;
+            g_phaseFrames = 0;
+        }
+        break;
 
     case PH_RETURNING:
         if (atOrigin) {
@@ -551,7 +703,9 @@ void cbWarp(ModContext*, void* ud) { g_reqWarp = static_cast<int>(reinterpret_ca
 void cbSetPortal(ModContext*, void* ud) { g_reqSetPortal = static_cast<int>(reinterpret_cast<intptr_t>(ud)); }
 void cbShowPos(ModContext*, void*) { g_reqShowPos = true; }
 void cbSavePos(ModContext*, void*) { g_reqSavePos = true; }
-void cbSpawn(ModContext*, void*) { g_reqSpawn = true; }
+void cbPlace(ModContext*, void*) { g_reqPlace = true; }
+void cbUndo(ModContext*, void*) { g_reqUndo = true; }
+void cbReload(ModContext*, void*) { g_reqReload = true; }
 void cbCancel(ModContext*, void*) { g_reqCancel = true; }
 void cbScan(ModContext*, void*) { g_reqScan = true; }
 
@@ -675,19 +829,12 @@ ModResult buildTeleport(ModContext*, UiWindowHandle, UiElementHandle left, UiEle
 
 ModResult buildDifficulty(ModContext*, UiWindowHandle, UiElementHandle left, UiElementHandle right, void*,
     ModError*) {
-    addSection(left, "Mode difficile");
-    addToggle(left, "Activer le mode difficile", v_hard,
-        "Des monstres supplémentaires surgissent à chaque nouvelle salle du donjon.");
-    addNumber(left, "Monstres en plus par salle", v_extra, 1, 6, 1, "", nullptr);
-    addMobDropdown(left, "Monstre du mode difficile", getHardMob, setHardMob,
-        "Identifiant du monstre à faire apparaître (à choisir avec l'onglet Débogage).");
     addSection(left, "Ambiance");
     addToggle(left, "Teinte sombre Crépuscule", v_tint, "Assombrit l'ambiance dans le donjon.");
     addNumber(left, "Luminosité", v_tintPct, 20, 100, 5, " %", "Plus bas = plus sombre.");
     addText(right,
-        "Mode difficile : plus de monstres par salle (vie personnalisable via les monstres Perso). "
-        "Pas encore de boss modifiés. La teinte est une approximation : le vrai filtre doré "
-        "nécessite un shader.");
+        "La teinte assombrit l'ambiance dans les donjons. C'est une approximation : le vrai "
+        "filtre doré du Crépuscule nécessite un shader.");
     return MOD_OK;
 }
 
@@ -712,16 +859,20 @@ ModResult buildDebug(ModContext*, UiWindowHandle, UiElementHandle left, UiElemen
         addNumber(left, kPt[i], v_dPoint[i], 0, 60, 1, "", nullptr);
         addNumber(left, kRm[i], v_dRoom[i], 0, 60, 1, "", nullptr);
     }
-    addSection(left, "Monstres");
-    addMobDropdown(left, "Monstre à faire apparaître", getSpawnMob, setSpawnMob,
+    addSection(left, "Monstres de la salle (éditeur de niveau)");
+    addMobDropdown(left, "Monstre à placer", getSpawnMob, setSpawnMob,
         "Seuls les monstres dont le code a été vérifié sont proposés.");
-    addButton(left, "Faire apparaître devant Link", cbSpawn, 0, nullptr);
+    addButton(left, "Placer le monstre devant Link", cbPlace, 0,
+        "Ajouté à la liste d'acteurs de la salle ; sauvegardé dans placements.txt.");
+    addButton(left, "Recharger la salle (garde ta position)", cbReload, 0,
+        "Recharge la salle pour faire apparaître les monstres placés, puis te remet au même endroit.");
+    addButton(left, "Annuler le dernier placement", cbUndo, 0, nullptr);
     addSection(left, "Sécurité");
     addButton(left, "Annuler le retour automatique", cbCancel, 0,
         "À utiliser si tu changes de sauvegarde pendant un donjon.");
     addText(right,
-        "Dossier de données : fichier locations.txt. Envoie-moi son contenu (ou les lignes LOCATION "
-        "et SPAWN du journal) pour que je règle les portails et les monstres.");
+        "Dossier de données : locations.txt (positions, scans) et placements.txt (monstres placés). "
+        "Envoie-moi ces fichiers pour que je règle les portails et les donjons.");
     return MOD_OK;
 }
 
@@ -729,7 +880,7 @@ void openMenu(ModContext*, void*) {
     UiTabDesc tabs[3] = {UI_TAB_DESC_INIT, UI_TAB_DESC_INIT, UI_TAB_DESC_INIT};
     tabs[0].title = "Téléporteurs";
     tabs[0].build = buildTeleport;
-    tabs[1].title = "Difficulté";
+    tabs[1].title = "Ambiance";
     tabs[1].build = buildDifficulty;
     tabs[2].title = "Débogage";
     tabs[2].build = buildDebug;
@@ -788,10 +939,21 @@ void processRequests(fopAc_ac_c* player, const char* stage, int room) {
             room);
         toast("Portail placé", buf);
     }
-    if (g_reqSpawn) {
-        g_reqSpawn = false;
-        spawnMob(player, g_spawnMob, 300.0f, 0.0f, room);
-        toast("Monstre", kMobs[std::clamp(g_spawnMob, 0, kMobCount - 1)].label, 2000);
+    if (g_reqPlace) {
+        g_reqPlace = false;
+        placeHere(player, stage, room);
+    }
+    if (g_reqUndo) {
+        g_reqUndo = false;
+        undoLast();
+    }
+    if (g_reqReload) {
+        g_reqReload = false;
+        if (g_phase == PH_NONE) {
+            startReload(player, stage, room);
+        } else {
+            toast("Déjà en cours", "Une téléportation est déjà en cours.");
+        }
     }
     if (g_reqWarp >= 0 && g_phase == PH_NONE) {
         const int d = g_reqWarp;
@@ -884,6 +1046,8 @@ MOD_EXPORT ModResult mod_initialize(ModError*) {
         g_dataDir = nullptr;
     }
 
+    loadPlacements();
+
     UiMenuTabDesc tab = UI_MENU_TAB_DESC_INIT;
     tab.label = "Crépuscule";
     tab.on_selected = openMenu;
@@ -891,7 +1055,7 @@ MOD_EXPORT ModResult mod_initialize(ModError*) {
         mods::log::error("Impossible d'ajouter l'onglet au menu");
     }
 
-    mods::log::info("Donjons du Crepuscule v1.2 charge (dossier de donnees : {})",
+    mods::log::info("Donjons du Crepuscule v2.0 charge (dossier de donnees : {})",
         g_dataDir ? g_dataDir : "(inconnu)");
     return MOD_OK;
 }
@@ -904,12 +1068,19 @@ MOD_EXPORT ModResult mod_update(ModError*) {
 
     fopAc_ac_c* player = dComIfGp_getPlayer(0);
     const char* stage = dComIfGp_getStartStageName();
-    if (player == nullptr || stage == nullptr || dComIfGp_event_runCheck()) {
+    if (player == nullptr || stage == nullptr) {
+        if (g_phase == PH_RELOAD) {
+            g_sawLoading = true;  // la salle est en train de se recharger
+        }
+        return MOD_OK;
+    }
+    if (dComIfGp_event_runCheck()) {
         return MOD_OK;
     }
     const int room = dComIfGp_roomControl_getStayNo();
     const u32 trig = mDoCPd_c::getTrig(0);
 
+    discoverHp(stage);
     updateHpJobs();
     processRequests(player, stage, room);
 

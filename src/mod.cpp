@@ -315,9 +315,14 @@ int procOfObj(const std::string& obj) {
 }
 
 bool registerEdit(Placement& p) {
-    stage_actor_data_class rec = {"E_ba", p.params, cXyz(p.x, p.y, p.z), csXyz(0, static_cast<s16>(p.yaw), 0), 0};
-    std::memset(rec.name, 0, sizeof(rec.name));
+    // Les champs sont stockes en big-endian (BE<...>) : on les remplit par affectation.
+    stage_actor_data_class rec;
+    std::memset(&rec, 0, sizeof(rec));
     std::strncpy(rec.name, p.obj.c_str(), 7);
+    rec.base.parameters = static_cast<u32>(p.params);
+    rec.base.position = cXyz(p.x, p.y, p.z);
+    rec.base.angle = csXyz(0, static_cast<s16>(p.yaw), 0);
+    rec.base.setID = static_cast<u16>(0);
     const ModResult r = svc_stage->add_actor(mod_ctx, p.stage.c_str(), static_cast<uint8_t>(p.room),
         static_cast<int8_t>(p.layer), &rec, sizeof(rec), &p.handle);
     p.active = (r == MOD_OK);

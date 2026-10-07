@@ -1,4 +1,4 @@
-// Donjons du Crepuscule - v2.0 (placement de monstres via StageService : plus de plantage au spawn)
+// Donjons du Crepuscule - v3.0 (mode difficile : vie des ennemis et degats multiplies dans les donjons)
 //
 //  * 3 teleporteurs (vert = Foret, rouge = Volcan, bleu = Lac) qui envoient dans les 3 premiers temples
 //    par le changement de stage natif du jeu (comme le Boss Rush de Twilit Essentials).
@@ -26,6 +26,7 @@
 #include "mods/service.hpp"
 #include "mods/svc/config.h"
 #include "mods/svc/host.h"
+#include "mods/svc/hook.hpp"
 #include "mods/svc/log.hpp"
 #include "mods/svc/stage.h"
 #include "mods/svc/ui.h"
@@ -42,9 +43,13 @@
 DEFINE_MOD();
 IMPORT_SERVICE(LogService, svc_log);
 IMPORT_SERVICE(ConfigService, svc_config);
+IMPORT_SERVICE(HookService, svc_hook);
 IMPORT_SERVICE(HostService, svc_host);
 IMPORT_SERVICE(StageService, svc_stage);
 IMPORT_SERVICE(UiService, svc_ui);
+
+// Hook : degats recus par Link (daAlink_c::setDamagePoint(int degats, BOOL, BOOL, int)).
+DEFINE_HOOK_SYMBOL("daAlink_c::setDamagePoint", int(void*, int, int, int, int), LinkDamage);
 
 namespace {
 
@@ -112,6 +117,7 @@ enum Phase { PH_NONE, PH_GOING, PH_INSIDE, PH_RETURNING, PH_ARRIVED, PH_RELOAD }
 // =============================================================================================
 
 // Variables de configuration (sauvegardees par Dusklight, visibles dans le menu)
+ConfigVarHandle v_dmgPct{}, v_hpPct{};
 ConfigVarHandle v_unlockAll{}, v_hard{}, v_extra{}, v_size{}, v_tint{}, v_hardMob{}, v_tintPct{};
 ConfigVarHandle v_unlock[3]{};
 ConfigVarHandle v_pSet[3]{}, v_pStage[3]{}, v_pRoom[3]{}, v_pX[3]{}, v_pY[3]{}, v_pZ[3]{};
@@ -160,6 +166,18 @@ int g_zone = -1;
 int g_lastRoom = -1;
 int g_hardSpawnedThisRaid = 0;
 bool g_tintActive = false;
+
+// Mode difficile (actif seulement dans le donjon, quand l'option est cochee)
+bool g_hardActive = false;
+int g_dmgPct = 200;
+int g_hpPct = 250;
+int g_frame = 0;
+struct SeenEnemy {
+    fpc_ProcID id;
+    int firstFrame;
+    bool done;
+};
+std::vector<SeenEnemy> g_seen;
 bool g_wasInDungeon = false;
 
 UiMenuTabHandle g_menuTab = 0;
@@ -451,6 +469,53 @@ void discoverHp(const std::string& stage) {
     g_discTimer = 0;
     std::string st = stage;
     fopAcIt_Executor(discCb, &st);
+}
+
+// ---- Mode difficile ---------------------------------------------------------------------------
+
+HookAction onDamagePre(ModContext*, void* args, void*, void*) {
+    if (g_hardActive) {
+        int& amount = mods::arg_ref<int>(args, 1);
+        if (amount > 0) {
+            amount = (amount * g_dmgPct + 99) / 100;  // arrondi vers le haut
+        }
+    }
+    return HOOK_CONTINUE;
+}
+
+// Multiplie la vie de chaque ennemi du donjon, une fois, quelques images apres son apparition
+// (l'ennemi fixe lui-meme sa vie dans sa creation). Ne touche pas aux ennemis sans vie commune (boss).
+int hardCb(void* actor, void*) {
+    fopAc_ac_c* a = static_cast<fopAc_ac_c*>(actor);
+    if (a == nullptr || fopAcM_GetGroup(a) != fopAc_ENEMY_e) {
+        return 1;
+    }
+    const fpc_ProcID id = fopAcM_GetID(a);
+    for (SeenEnemy& e : g_seen) {
+        if (e.id == id) {
+            if (!e.done && g_frame - e.firstFrame >= 15) {
+                e.done = true;
+                if (a->health > 0 && a->field_0x560 > 0) {
+                    const int hp = std::min(30000, (a->health * g_hpPct + 99) / 100);
+                    const int mx = std::min(30000, (a->field_0x560 * g_hpPct + 99) / 100);
+                    a->health = static_cast<s16>(hp);
+                    a->field_0x560 = static_cast<s16>(mx);
+                }
+            }
+            return 1;
+        }
+    }
+    if (g_seen.size() < 400) {
+        g_seen.push_back({id, g_frame, false});
+    }
+    return 1;
+}
+
+void updateHard() {
+    ++g_frame;
+    if (g_frame % 5 == 0) {
+        fopAcIt_Executor(hardCb, nullptr);
+    }
 }
 
 // Applique la vie voulue : l'acteur fixe sa propre vie dans sa creation, donc on la redefinit
@@ -834,12 +899,18 @@ ModResult buildTeleport(ModContext*, UiWindowHandle, UiElementHandle left, UiEle
 
 ModResult buildDifficulty(ModContext*, UiWindowHandle, UiElementHandle left, UiElementHandle right, void*,
     ModError*) {
+    addSection(left, "Mode difficile (dans les donjons des portails)");
+    addToggle(left, "Activer le mode difficile", v_hard,
+        "Ennemis du donjon plus résistants et dégâts reçus multipliés.");
+    addNumber(left, "Vie des ennemis", v_hpPct, 100, 1000, 50, " %", "250 % = 2,5 fois plus de vie.");
+    addNumber(left, "Dégâts reçus par Link", v_dmgPct, 100, 500, 25, " %", "200 % = double dégâts.");
     addSection(left, "Ambiance");
     addToggle(left, "Teinte sombre Crépuscule", v_tint, "Assombrit l'ambiance dans le donjon.");
     addNumber(left, "Luminosité", v_tintPct, 20, 100, 5, " %", "Plus bas = plus sombre.");
     addText(right,
-        "La teinte assombrit l'ambiance dans les donjons. C'est une approximation : le vrai "
-        "filtre doré du Crépuscule nécessite un shader.");
+        "Mode difficile : s'applique aux ennemis d'origine du donjon (ceux qui utilisent la vie "
+        "commune du jeu ; certains boss ont leur propre système et ne sont pas touchés). "
+        "La teinte est une approximation du filtre Crépuscule.");
     return MOD_OK;
 }
 
@@ -885,7 +956,7 @@ void openMenu(ModContext*, void*) {
     UiTabDesc tabs[3] = {UI_TAB_DESC_INIT, UI_TAB_DESC_INIT, UI_TAB_DESC_INIT};
     tabs[0].title = "Téléporteurs";
     tabs[0].build = buildTeleport;
-    tabs[1].title = "Ambiance";
+    tabs[1].title = "Difficulté";
     tabs[1].build = buildDifficulty;
     tabs[2].title = "Débogage";
     tabs[2].build = buildDebug;
@@ -1011,6 +1082,8 @@ MOD_EXPORT ModResult mod_initialize(ModError*) {
     ok &= regBool("tint", false, &v_tint);
     ok &= regInt("tint_pct", 55, &v_tintPct);
     ok &= regInt("hard_mob", 0, &v_hardMob);
+    ok &= regInt("dmg_pct", 200, &v_dmgPct);
+    ok &= regInt("hp_pct", 250, &v_hpPct);
 
     static char names[3][8][24];
     for (int i = 0; i < 3; ++i) {
@@ -1053,6 +1126,10 @@ MOD_EXPORT ModResult mod_initialize(ModError*) {
 
     loadPlacements();
 
+    if (mods::hook::add_pre<LinkDamage>(onDamagePre) != MOD_OK) {
+        mods::log::error("Hook des degats indisponible : le mode difficile ne multipliera pas les degats");
+    }
+
     UiMenuTabDesc tab = UI_MENU_TAB_DESC_INIT;
     tab.label = "Crépuscule";
     tab.on_selected = openMenu;
@@ -1060,7 +1137,7 @@ MOD_EXPORT ModResult mod_initialize(ModError*) {
         mods::log::error("Impossible d'ajouter l'onglet au menu");
     }
 
-    mods::log::info("Donjons du Crepuscule v2.0 charge (dossier de donnees : {})",
+    mods::log::info("Donjons du Crepuscule v3.0 charge (dossier de donnees : {})",
         g_dataDir ? g_dataDir : "(inconnu)");
     return MOD_OK;
 }
@@ -1085,6 +1162,14 @@ MOD_EXPORT ModResult mod_update(ModError*) {
     const int room = dComIfGp_roomControl_getStayNo();
     const u32 trig = mDoCPd_c::getTrig(0);
 
+    g_hardActive = (g_phase == PH_INSIDE) && cfgBool(v_hard);
+    if (g_hardActive) {
+        g_dmgPct = std::clamp(cfgInt(v_dmgPct), 100, 1000);
+        g_hpPct = std::clamp(cfgInt(v_hpPct), 100, 2000);
+        updateHard();
+    } else if (!g_seen.empty()) {
+        g_seen.clear();
+    }
     discoverHp(stage);
     updateHpJobs();
     processRequests(player, stage, room);

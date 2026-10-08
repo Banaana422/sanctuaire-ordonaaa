@@ -1,4 +1,4 @@
-// Donjons du Crepuscule - v3.0 (mode difficile : vie des ennemis et degats multiplies dans les donjons)
+// Donjons du Crepuscule - v3.1 (pack difficile du Temple de la Foret + mode difficile)
 //
 //  * 3 teleporteurs (vert = Foret, rouge = Volcan, bleu = Lac) qui envoient dans les 3 premiers temples
 //    par le changement de stage natif du jeu (comme le Boss Rush de Twilit Essentials).
@@ -39,6 +39,7 @@
 #include "m_Do/m_Do_controller_pad.h"
 
 #include "proc_names.hpp"
+#include "forest_pack.hpp"
 
 DEFINE_MOD();
 IMPORT_SERVICE(LogService, svc_log);
@@ -117,7 +118,7 @@ enum Phase { PH_NONE, PH_GOING, PH_INSIDE, PH_RETURNING, PH_ARRIVED, PH_RELOAD }
 // =============================================================================================
 
 // Variables de configuration (sauvegardees par Dusklight, visibles dans le menu)
-ConfigVarHandle v_dmgPct{}, v_hpPct{};
+ConfigVarHandle v_dmgPct{}, v_hpPct{}, v_pack{};
 ConfigVarHandle v_unlockAll{}, v_hard{}, v_extra{}, v_size{}, v_tint{}, v_hardMob{}, v_tintPct{};
 ConfigVarHandle v_unlock[3]{};
 ConfigVarHandle v_pSet[3]{}, v_pStage[3]{}, v_pRoom[3]{}, v_pX[3]{}, v_pY[3]{}, v_pZ[3]{};
@@ -317,8 +318,10 @@ struct Placement {
     int yaw = 0, hp = 0;
     StageActorHandle handle = 0;
     bool active = false;
+    bool pack = false;   // fait partie du pack integre (non sauvegarde dans placements.txt)
 };
 std::vector<Placement> g_place;
+bool g_packApplied = false;
 std::vector<fpc_ProcID> g_hpKnown;
 std::string g_lastHpStage;
 int g_discTimer = 0;
@@ -356,6 +359,9 @@ void savePlacements() {
     }
     std::ofstream f(std::string(g_dataDir) + "/placements.txt", std::ios::trunc);
     for (const Placement& p : g_place) {
+        if (p.pack) {
+            continue;
+        }
         char line[256];
         std::snprintf(line, sizeof(line), "%s|%d|%d|%s|%u|%.1f|%.1f|%.1f|%d|%d", p.stage.c_str(), p.room,
             p.layer, p.obj.c_str(), static_cast<unsigned>(p.params), p.x, p.y, p.z, p.yaw, p.hp);
@@ -410,17 +416,61 @@ void placeHere(fopAc_ac_c* player, const char* stage, int room) {
 }
 
 void undoLast() {
-    if (g_place.empty()) {
-        toast("Rien à annuler", "Aucun monstre placé.");
+    for (int i = static_cast<int>(g_place.size()) - 1; i >= 0; --i) {
+        if (g_place[static_cast<size_t>(i)].pack) {
+            continue;
+        }
+        Placement& p = g_place[static_cast<size_t>(i)];
+        if (p.active) {
+            svc_stage->remove_actor_edit(mod_ctx, p.handle);
+        }
+        g_place.erase(g_place.begin() + i);
+        savePlacements();
+        toast("Placement annulé", "Il disparaîtra au prochain chargement de la salle.");
         return;
     }
-    Placement& p = g_place.back();
-    if (p.active) {
-        svc_stage->remove_actor_edit(mod_ctx, p.handle);
+    toast("Rien à annuler", "Aucun monstre placé.");
+}
+
+// Active ou retire le pack difficile du Temple de la Foret (monstres ajoutes aux salles du donjon).
+void applyPack(bool on) {
+    if (on == g_packApplied) {
+        return;
     }
-    g_place.pop_back();
-    savePlacements();
-    toast("Placement annulé", "Il disparaîtra au prochain chargement de la salle.");
+    if (on) {
+        int ok = 0;
+        for (int i = 0; i < kForestPackCount; ++i) {
+            const PackEntry& e = kForestPack[i];
+            Placement p;
+            p.stage = e.stage;
+            p.room = e.room;
+            p.layer = -1;
+            p.obj = e.obj;
+            p.params = e.params;
+            p.x = e.x;
+            p.y = e.y;
+            p.z = e.z;
+            p.yaw = e.yaw;
+            p.hp = e.hp;
+            p.pack = true;
+            if (registerEdit(p)) {
+                ++ok;
+            }
+            g_place.push_back(p);
+        }
+        mods::log::info("PACK foret : {}/{} monstres enregistres", ok, kForestPackCount);
+    } else {
+        for (size_t i = g_place.size(); i-- > 0;) {
+            if (g_place[i].pack) {
+                if (g_place[i].active) {
+                    svc_stage->remove_actor_edit(mod_ctx, g_place[i].handle);
+                }
+                g_place.erase(g_place.begin() + static_cast<long>(i));
+            }
+        }
+        mods::log::info("PACK foret retire");
+    }
+    g_packApplied = on;
 }
 
 bool anyHpPlacement(const std::string& stage) {
@@ -899,6 +949,9 @@ ModResult buildTeleport(ModContext*, UiWindowHandle, UiElementHandle left, UiEle
 
 ModResult buildDifficulty(ModContext*, UiWindowHandle, UiElementHandle left, UiElementHandle right, void*,
     ModError*) {
+    addSection(left, "Temple de la Forêt");
+    addToggle(left, "Pack difficile du Temple de la Forêt", v_pack,
+        "Ajoute des Shadow Keese (vie 10 à 20) dans chaque salle scannée du temple et dans la salle du boss. Effet au prochain chargement de chaque salle.");
     addSection(left, "Mode difficile (dans les donjons des portails)");
     addToggle(left, "Activer le mode difficile", v_hard,
         "Ennemis du donjon plus résistants et dégâts reçus multipliés.");
@@ -1084,6 +1137,7 @@ MOD_EXPORT ModResult mod_initialize(ModError*) {
     ok &= regInt("hard_mob", 0, &v_hardMob);
     ok &= regInt("dmg_pct", 200, &v_dmgPct);
     ok &= regInt("hp_pct", 250, &v_hpPct);
+    ok &= regBool("forest_pack", true, &v_pack);
 
     static char names[3][8][24];
     for (int i = 0; i < 3; ++i) {
@@ -1125,6 +1179,7 @@ MOD_EXPORT ModResult mod_initialize(ModError*) {
     }
 
     loadPlacements();
+    applyPack(cfgBool(v_pack));
 
     if (mods::hook::add_pre<LinkDamage>(onDamagePre) != MOD_OK) {
         mods::log::error("Hook des degats indisponible : le mode difficile ne multipliera pas les degats");
@@ -1137,7 +1192,7 @@ MOD_EXPORT ModResult mod_initialize(ModError*) {
         mods::log::error("Impossible d'ajouter l'onglet au menu");
     }
 
-    mods::log::info("Donjons du Crepuscule v3.0 charge (dossier de donnees : {})",
+    mods::log::info("Donjons du Crepuscule v3.1 charge (dossier de donnees : {})",
         g_dataDir ? g_dataDir : "(inconnu)");
     return MOD_OK;
 }
@@ -1170,6 +1225,7 @@ MOD_EXPORT ModResult mod_update(ModError*) {
     } else if (!g_seen.empty()) {
         g_seen.clear();
     }
+    applyPack(cfgBool(v_pack));
     discoverHp(stage);
     updateHpJobs();
     processRequests(player, stage, room);
